@@ -1,0 +1,50 @@
+name: rino-life
+
+services:
+  postgres:
+    image: postgres:16.10-alpine
+    container_name: rino-life-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${RINO_LIFE_DB_NAME:?set RINO_LIFE_DB_NAME}
+      POSTGRES_USER: ${RINO_LIFE_DB_USER:?set RINO_LIFE_DB_USER}
+      POSTGRES_PASSWORD: ${RINO_LIFE_DB_PASSWORD:?set RINO_LIFE_DB_PASSWORD}
+    ports:
+      - "127.0.0.1:${RINO_LIFE_POSTGRES_PORT:-54329}:5432"
+    volumes:
+      - rino_life_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks: [life_internal]
+  nats:
+    image: nats:2.10.27-alpine
+    container_name: rino-life-nats
+    restart: unless-stopped
+    command: ["-js", "-sd", "/data", "-m", "8222", "--user", "${RINO_LIFE_NATS_USER:?set RINO_LIFE_NATS_USER}", "--pass", "${RINO_LIFE_NATS_PASSWORD:?set RINO_LIFE_NATS_PASSWORD}"]
+    ports:
+      - "127.0.0.1:${RINO_LIFE_NATS_PORT:-54222}:4222"
+      - "127.0.0.1:${RINO_LIFE_NATS_MONITOR_PORT:-58222}:8222"
+    volumes:
+      - rino_life_nats:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/healthz > /dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks: [life_internal]
+volumes:
+  rino_life_postgres:
+    name: rino_life_postgres
+  rino_life_nats:
+    name: rino_life_nats
+networks:
+  life_internal:
+    name: rino_life_internal
+    # Access is restricted by loopback-only port bindings. `internal: true` would
+    # also block the host-resident Rino Agent/Life API from reaching these services.
+    internal: false

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["item_id", "remaining", "threshold"],
+  "properties": {
+    "item_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "remaining": {"type": "number", "minimum": 0},
+    "threshold": {"type": "number", "minimum": 0},
+    "name": {"type": "string", "maxLength": 128},
+    "unit": {"type": "string", "maxLength": 32}
+  }
+}

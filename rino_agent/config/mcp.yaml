@@ -1,0 +1,21 @@
+servers:
+  switchbot:
+    enabled: true
+    transport: stdio
+    trust: internal
+  life:
+    enabled: true
+    transport: stdio
+    trust: internal
+  obs:
+    enabled: false
+    transport: stdio
+    trust: internal
+  comfyui:
+    enabled: false
+    transport: stdio
+    trust: internal
+  windows:
+    enabled: false
+    transport: stdio
+    trust: internal

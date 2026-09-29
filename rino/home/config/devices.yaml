@@ -1,0 +1,23 @@
+provider: switchbot
+
+# device_id_env の値は環境変数名です。Device ID 自体はここへ書かないでください。
+devices:
+  environment:
+    alias: co2_meter
+    device_id_env: SWITCHBOT_CO2_DEVICE_ID
+  light:
+    alias: room_light
+    device_id_env: SWITCHBOT_LIGHT_DEVICE_ID
+  aircon:
+    alias: air_conditioner
+    device_id_env: SWITCHBOT_AIRCON_DEVICE_ID
+  tv:
+    alias: television
+    device_id_env: SWITCHBOT_TV_DEVICE_ID
+  entrance:
+    alias: entrance_lock
+    device_id_env: SWITCHBOT_LOCK_DEVICE_ID
+    permissions:
+      read: true
+      lock: true
+      unlock: false

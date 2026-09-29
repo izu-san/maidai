@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://maidai.local/contracts/life-envelope.v1.schema.json",
+  "title": "Rino Life Event Envelope v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "type", "occurred_at", "source", "payload"],
+  "properties": {
+    "id": {"type": "string", "format": "uuid"},
+    "type": {"type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+\\.v[1-9][0-9]*$"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "source": {"type": "string", "minLength": 1, "maxLength": 64},
+    "actor": {"type": ["string", "null"], "maxLength": 128},
+    "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "correlation_id": {"type": ["string", "null"], "maxLength": 128},
+    "causation_id": {"type": ["string", "null"], "format": "uuid"},
+    "payload": {"type": "object"}
+  }
+}

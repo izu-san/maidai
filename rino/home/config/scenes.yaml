@@ -1,0 +1,7 @@
+scenes:
+  sleep:
+    actions:
+      - tv.off
+      - light.off
+  gaming:
+    actions: []

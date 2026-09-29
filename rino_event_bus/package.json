@@ -1,0 +1,17 @@
+{
+  "name": "@rino/event-bus",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "test": "npm run build && node --test dist/**/*.test.js"
+  },
+  "dependencies": {
+    "eventemitter2": "^6.4.9",
+    "nats": "^2.29.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}

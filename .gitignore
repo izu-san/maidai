@@ -1,0 +1,50 @@
+# --- 秘密情報（実値。*.example は追跡する） ---
+.env
+.env.*
+!.env.example
+!.env.life.example
+*.pem
+*.key
+*.pfx
+
+# --- 外部の同梱物・モデル（本プロジェクトのコードではない） ---
+/GPT-SoVITS/
+/SillyTavern/
+/SillyTavern-extras/
+/koboldcpp/
+/rvc-python/
+/models/
+
+# --- 実行時データ・ログ・バックアップ（会話・操作履歴・個人データを含み得る） ---
+/logs/
+/backups/
+/rino_agent/data/
+*.jsonl
+*.log
+/chat.txt
+/stdout.txt
+
+# --- キャラクター設定（非公開） ---
+*.card.json
+/梨乃*.png
+/docs/character/
+
+# --- 非公開ツール ---
+/tools/Build-AzurLaneRag.mjs
+
+# --- 生成物・キャッシュ ---
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+node_modules/
+dist/
+
+# --- エディタ・OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,1 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["device_id","state","observed_at"],"properties":{"device_id":{"type":"string","minLength":1,"maxLength":128},"device_type":{"type":"string","minLength":1,"maxLength":64},"state":{"type":"object"},"observed_at":{"type":"string","format":"date-time"}}}

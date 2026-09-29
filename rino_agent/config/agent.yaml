@@ -1,0 +1,11 @@
+agent:
+  mode: assist
+  model:
+    provider: openai_compatible
+    base_url: http://127.0.0.1:5001/v1/
+    model: koboldcpp/gemma-4-26B_q4_0-it
+  checkpoint:
+    provider: file
+    path: ./data/checkpoints
+  autonomous_actions:
+    max_risk: LOW

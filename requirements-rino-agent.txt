@@ -1,0 +1,15 @@
+agent-framework-core==1.19.0
+agent-framework-openai==1.14.4
+fastapi==0.133.1
+mcp==1.30.0
+obsws-python==1.8.0
+pycaw==20251023
+Pillow==12.1.1
+psutil==7.2.2
+uvicorn==0.41.0
+SQLAlchemy==2.0.48
+psycopg[binary]==3.2.12
+alembic==1.16.5
+nats-py==2.12.0
+jsonschema==4.25.1
+PyYAML==6.0.2

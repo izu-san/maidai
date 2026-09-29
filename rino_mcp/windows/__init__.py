@@ -1,0 +1,1 @@
+"""Allowlisted Windows MCP server."""

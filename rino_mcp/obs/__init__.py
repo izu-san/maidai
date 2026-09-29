@@ -1,0 +1,1 @@
+"""OBS WebSocket MCP server."""

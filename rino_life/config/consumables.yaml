@@ -1,0 +1,27 @@
+consumables:
+  laundry_detergent:
+    name: "洗濯洗剤"
+    category: household
+    unit: ml
+    capacity: 1450
+    remaining: 400
+    stock_unopened: 0
+    usage:
+      type: PER_EVENT
+      event: laundry.completed
+      amount: 14
+    reminder:
+      remaining_below: 150
+  fabric_softener:
+    name: "柔軟剤"
+    category: household
+    unit: ml
+    capacity: 1150
+    remaining: 1150
+    stock_unopened: 0
+    usage:
+      type: PER_EVENT
+      event: laundry.completed
+      amount: 16
+    reminder:
+      remaining_below: 100
