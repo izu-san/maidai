@@ -47,6 +47,8 @@ lint / フォーマッタの設定はない。
 
 **Event Bus（`rino_event_bus/`）** — TypeScript のローカルイベントバス。`switchbot-nats-bridge.ts` が SwitchBot 観測をローカルバスから JetStream へ一方向に転送する（購読しないのでループしない）。`agent-event-bridge.ts` は Agent Service との橋渡し。
 
+**起動ウィジェット（`rino_launcher/`）** — PySide6 のデスクトップウィジェット（`Start-MaidAIWidget.cmd`、依存は `requirements-rino-launcher.txt`）。`Start-MaidAI.ps1 -Status -Json` / `-Component <名前> -Action start|stop|restart` を子プロセスで呼ぶだけで、ポートや起動コマンドの定義は `Start-MaidAI.ps1` 側にのみ置く。`status_model.py` は Qt 非依存（テスト対象）。
+
 **ドキュメント** — 入口は `docs/README.md`、現行機能の正は `docs/getting-started/リポジトリ概要と梨乃の使い方.md`。設計文書と実装が食い違う場合は、コード・`rino_agent/config/*.yaml`・Compose を正とする。機能変更時は `AGENTS.md` の対応表に従い、同ファイル末尾の改訂履歴も更新する。
 
 ## テスト

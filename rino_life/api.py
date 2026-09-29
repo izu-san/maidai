@@ -2,13 +2,36 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from .consumables import ConsumableService
 from .contracts import LifeEventEnvelope
 from .phase5 import Phase5Service
 
-app = FastAPI(title="Rino Life API", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # The API owns the host-resident Life workers.  They only consume/publish
+    # versioned NATS events; notification delivery remains the injected no-op
+    # adapter and never triggers Agent actions.
+    from .environment_consumer import run_environment_consumer
+    from .notifications import run_notification_router
+    from .outbox import run_outbox_publisher
+    from .pc import run_pc_consumer
+    from .vision import run_vision_consumer
+    tasks = [asyncio.create_task(worker()) for worker in (
+        run_outbox_publisher, run_notification_router, run_environment_consumer,
+        run_pc_consumer, run_vision_consumer,
+    )]
+    try:
+        yield
+    finally:
+        for task in tasks: task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError): await task
+
+app = FastAPI(title="Rino Life API", docs_url=None, redoc_url=None, lifespan=lifespan)
 service = ConsumableService()
 phase5_service = Phase5Service()
 

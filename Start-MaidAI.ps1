@@ -1,4 +1,4 @@
-<#
+﻿<#
   MaidAI の起動ハブ
   例:
     .\Start-MaidAI.ps1                 # 会話用（Gemma 4 → SillyTavern → Rino Agent Service）
@@ -6,6 +6,8 @@
     .\Start-MaidAI.ps1 -Status
     .\Start-MaidAI.ps1 -Stop
     .\Start-MaidAI.ps1 -RestartSillyTavern
+    .\Start-MaidAI.ps1 -Status -Json   # 機械可読な状態（デスクトップウィジェットが使用）
+    .\Start-MaidAI.ps1 -Component 'SillyTavern' -Action restart   # 個別の起動 / 停止 / 再起動
 
   Docker のサービスは下部の $DockerProjects と $DockerContainers で管理する。
 #>
@@ -15,7 +17,12 @@ param(
     [string] $Profile = 'chat',
     [switch] $Status,
     [switch] $Stop,
-    [switch] $RestartSillyTavern
+    [switch] $RestartSillyTavern,
+    [Alias('Component')]
+    [string] $ComponentName,
+    [ValidateSet('start', 'stop', 'restart')]
+    [string] $Action,
+    [switch] $Json
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,16 +40,16 @@ function Import-RinoEnvironment {
         'RINO_IMAGE_GENERATION_ENABLED', 'RINO_IMAGE_WORKFLOW', 'RINO_IMAGE_PROMPT_NODE', 'RINO_IMAGE_PROMPT_INPUT',
         'RINO_IMAGE_COMFYUI_URL', 'RINO_IMAGE_KOBOLD_URL', 'RINO_IMAGE_COMFYUI_OUTPUT_DIR',
         'RINO_IMAGE_PUBLIC_OUTPUT_DIR', 'RINO_IMAGE_PUBLIC_URL_PREFIX', 'RINO_IMAGE_KOBOLD_PROCESS',
-        'RINO_IMAGE_KOBOLD_START', 'RINO_IMAGE_COMFYUI_START'
-        ,'RINO_LIFE_DB_NAME', 'RINO_LIFE_DB_USER', 'RINO_LIFE_DB_PASSWORD',
+        'RINO_IMAGE_KOBOLD_START', 'RINO_IMAGE_COMFYUI_START',
+        'RINO_LIFE_DB_NAME', 'RINO_LIFE_DB_USER', 'RINO_LIFE_DB_PASSWORD',
         'RINO_LIFE_POSTGRES_PORT', 'RINO_LIFE_NATS_USER', 'RINO_LIFE_NATS_PASSWORD',
         'RINO_LIFE_NATS_PORT', 'RINO_LIFE_NATS_MONITOR_PORT', 'RINO_LIFE_API_URL',
         'RINO_LIFE_DATABASE_URL', 'RINO_LIFE_NATS_URL'
     )
     $envFiles = @(
         (Join-Path $Root 'rino\home\.env'),
-        (Join-Path $Root 'rino_agent\.env')
-        ,(Join-Path $Root 'infra\.env.life')
+        (Join-Path $Root 'rino_agent\.env'),
+        (Join-Path $Root 'infra\.env.life')
     )
     foreach ($envFile in $envFiles) {
         if (-not (Test-Path -LiteralPath $envFile)) { continue }
@@ -71,12 +78,14 @@ function Test-RinoAgentEnvironment {
 
 Import-RinoEnvironment
 
-# Compose 起動は既定では行わない。必要になった場合だけここに登録する。
-# 例: @{ Name = 'search'; Path = 'D:\AI\my-search\compose.yaml'; Services = @() }
+# Compose プロジェクトはここで一元管理する。Rino Life は chat / full / docker
+# プロファイルで必ず起動し、Compose の healthcheck が通るまで待機する。
 $DockerProjects = @(
-    @{ Name = 'Rino Life'; Path = (Join-Path $Root 'infra\compose.life.yaml'); EnvFile = (Join-Path $Root 'infra\.env.life'); Services = @() }
+    @{ Name = 'Rino Life'; Path = (Join-Path $Root 'infra\compose.life.yaml'); EnvFile = (Join-Path $Root 'infra\.env.life'); Services = @(); Containers = @('rino-life-postgres', 'rino-life-nats') }
 )
 $DockerContainers = @(
+    @{ Name = 'Rino Life PostgreSQL'; Container = 'rino-life-postgres'; Port = 54329; TimeoutSeconds = 30 },
+    @{ Name = 'Rino Life NATS'; Container = 'rino-life-nats'; Port = 54222; TimeoutSeconds = 30 },
     @{ Name = 'MemPalace'; Container = 'mempalace'; Port = 8052; TimeoutSeconds = 120 },
     @{ Name = 'SearXNG'; Container = 'searxng'; Port = 8888; TimeoutSeconds = 120 }
 )
@@ -123,63 +132,107 @@ function Wait-ForPort([string] $Name, [int] $Port, [int] $TimeoutSeconds) {
     throw "$Name did not become ready on port $Port within $TimeoutSeconds seconds."
 }
 
+# 状態を機械可読なオブジェクトで返す。state は running / loading / stopped / missing / unavailable。
+# kind は process（ローカルプロセス）/ container（Docker コンテナ）/ project（Compose プロジェクト）。
+function Get-MaidAIStatus {
+    $items = @()
+    foreach ($component in $Components) {
+        $state = 'stopped'
+        $listenerPid = $null
+        $processName = $null
+        if ($component.Name -eq 'KoboldCpp (Gemma 4)' -and (Get-Process -Name 'koboldcpp' -ErrorAction SilentlyContinue) -and -not (Get-PortProcess $component.Port)) {
+            $state = 'loading'
+        } else {
+            $listenerPid = Get-PortProcess $component.Port
+            if ($listenerPid) {
+                $state = 'running'
+                $processName = (Get-Process -Id $listenerPid -ErrorAction SilentlyContinue).ProcessName
+            }
+        }
+        $items += [pscustomobject]@{ name = $component.Name; kind = 'process'; port = $component.Port; state = $state; pid = $listenerPid; process = $processName }
+    }
+    $docker = Get-Command docker -ErrorAction SilentlyContinue
+    $containerStates = @{}
+    foreach ($container in $DockerContainers) {
+        $state = 'unavailable'
+        if ($docker) {
+            $raw = Get-DockerContainerState $container.Container
+            $containerStates[$container.Container] = $raw
+            $state = if ($raw -eq 'running') { 'running' } elseif ($raw) { 'stopped' } else { 'missing' }
+        }
+        $items += [pscustomobject]@{ name = $container.Name; kind = 'container'; port = $container.Port; state = $state; pid = $null; process = $null }
+    }
+    foreach ($project in $DockerProjects) {
+        $state = 'unavailable'
+        if ($docker) {
+            $members = @($project.Containers)
+            $running = @($members | Where-Object { $containerStates[$_] -eq 'running' })
+            $state = if ($members.Count -and $running.Count -eq $members.Count) { 'running' } elseif ($running.Count) { 'loading' } else { 'stopped' }
+        }
+        $items += [pscustomobject]@{ name = $project.Name; kind = 'project'; port = 0; state = $state; pid = $null; process = $null }
+    }
+    return $items
+}
+
 function Show-Status {
     Write-Host "`nMaidAI status" -ForegroundColor Cyan
-    foreach ($component in $Components) {
-        if ($component.Port -le 0) {
-            Write-Host ("  {0,-18} port auto-detected / check its console" -f $component.Name) -ForegroundColor DarkYellow
-            continue
+    $docker = Get-Command docker -ErrorAction SilentlyContinue
+    $dockerShown = $false
+    foreach ($item in (Get-MaidAIStatus)) {
+        if ($item.kind -ne 'process' -and -not $dockerShown) {
+            Write-Host ("  Docker CLI           {0}" -f $(if ($docker) { 'available' } else { 'not installed / not in PATH' })) -ForegroundColor $(if ($docker) { 'Green' } else { 'DarkYellow' })
+            $dockerShown = $true
         }
-        if ($component.Name -eq 'KoboldCpp (Gemma 4)' -and (Get-Process -Name 'koboldcpp' -ErrorAction SilentlyContinue) -and -not (Get-PortProcess $component.Port)) {
-            Write-Host ("  {0,-18} LOADING  model is being loaded" -f $component.Name) -ForegroundColor Yellow
-            continue
-        }
-        $listenerPid = Get-PortProcess $component.Port
-        if ($listenerPid) {
-            $process = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
-            Write-Host ("  {0,-18} RUNNING  http://127.0.0.1:{1}  (PID {2}: {3})" -f $component.Name, $component.Port, $listenerPid, $process.ProcessName) -ForegroundColor Green
-        } else {
-            Write-Host ("  {0,-18} stopped  (port {1})" -f $component.Name, $component.Port) -ForegroundColor DarkGray
-        }
-    }
-    if ($DockerProjects.Count -or $DockerContainers.Count) {
-        $docker = Get-Command docker -ErrorAction SilentlyContinue
-        Write-Host ("  Docker CLI           {0}" -f $(if ($docker) { 'available' } else { 'not installed / not in PATH' })) -ForegroundColor $(if ($docker) { 'Green' } else { 'DarkYellow' })
-        if ($docker) {
-            foreach ($container in $DockerContainers) {
-                $state = Get-DockerContainerState $container.Container
-                $color = if ($state -eq 'running') { 'Green' } elseif ($state) { 'DarkYellow' } else { 'DarkGray' }
-                $label = if ($state) { $state } else { 'not found' }
-                Write-Host ("  Docker {0,-11} {1}" -f $container.Name, $label) -ForegroundColor $color
+        if ($item.kind -eq 'process') {
+            switch ($item.state) {
+                'loading' { Write-Host ("  {0,-18} LOADING  model is being loaded" -f $item.name) -ForegroundColor Yellow }
+                'running' { Write-Host ("  {0,-18} RUNNING  http://127.0.0.1:{1}  (PID {2}: {3})" -f $item.name, $item.port, $item.pid, $item.process) -ForegroundColor Green }
+                default { Write-Host ("  {0,-18} stopped  (port {1})" -f $item.name, $item.port) -ForegroundColor DarkGray }
             }
+        } elseif ($docker) {
+            $color = switch ($item.state) { 'running' { 'Green' } 'loading' { 'Yellow' } 'missing' { 'DarkGray' } default { 'DarkYellow' } }
+            $label = if ($item.state -eq 'missing') { 'not found' } else { $item.state }
+            Write-Host ("  Docker {0,-11} {1}" -f $item.name, $label) -ForegroundColor $color
         }
     }
 }
 
 function Get-DockerContainerState([string] $ContainerName) {
-    $state = & docker container inspect --format '{{.State.Status}}' $ContainerName 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    return $state.Trim()
+    # コンテナ未作成時の docker の stderr を、$ErrorActionPreference='Stop' 下で例外化させない
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $state = & docker container inspect --format '{{.State.Status}}' $ContainerName 2>$null
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($exitCode -ne 0 -or -not $state) { return $null }
+    return ([string]($state | Select-Object -First 1)).Trim()
 }
 
-function Start-Component($component) {
-    if (-not (Test-Path -LiteralPath $component.File)) {
-        Write-Warning "$($component.Name): launch file not found: $($component.File)"
+function Start-Component($ComponentConfig) {
+    if ($null -eq $ComponentConfig -or [string]::IsNullOrWhiteSpace([string] $ComponentConfig.File)) {
+        $componentName = if ($null -eq $ComponentConfig) { '<undefined>' } elseif ($ComponentConfig.Name) { $ComponentConfig.Name } else { '<unnamed>' }
+        throw "${componentName}: component configuration is missing its launch file."
+    }
+    if (-not (Test-Path -LiteralPath $ComponentConfig.File)) {
+        Write-Warning "$($ComponentConfig.Name): launch file not found: $($ComponentConfig.File)"
         return
     }
-    if ($component.Port -gt 0 -and (Get-PortProcess $component.Port)) {
-        Write-Host "$($component.Name): already running (port $($component.Port))." -ForegroundColor Yellow
+    if ($ComponentConfig.Port -gt 0 -and (Get-PortProcess $ComponentConfig.Port)) {
+        Write-Host "$($ComponentConfig.Name): already running (port $($ComponentConfig.Port))." -ForegroundColor Yellow
         return
     }
-    if ($component.Name -eq 'KoboldCpp (Gemma 4)' -and (Get-Process -Name 'koboldcpp' -ErrorAction SilentlyContinue)) {
-        Write-Host "$($component.Name): a KoboldCpp process is already loading or running." -ForegroundColor Yellow
+    if ($ComponentConfig.Name -eq 'KoboldCpp (Gemma 4)' -and (Get-Process -Name 'koboldcpp' -ErrorAction SilentlyContinue)) {
+        Write-Host "$($ComponentConfig.Name): a KoboldCpp process is already loading or running." -ForegroundColor Yellow
         return
     }
-    Write-Host "Starting $($component.Name)..." -ForegroundColor Cyan
-    switch ($component.Kind) {
-        'exe' { Start-Process -FilePath $component.File -ArgumentList $component.Args -WorkingDirectory (Split-Path $component.File) -WindowStyle Hidden }
-        'cmd' { Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', 'call', ('"{0}"' -f $component.File)) -WorkingDirectory (Split-Path $component.File) -WindowStyle Hidden }
-        'powershell' { Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $component.File)) -WorkingDirectory (Split-Path $component.File) -WindowStyle Hidden }
+    Write-Host "Starting $($ComponentConfig.Name)..." -ForegroundColor Cyan
+    switch ($ComponentConfig.Kind) {
+        'exe' { Start-Process -FilePath $ComponentConfig.File -ArgumentList $ComponentConfig.Args -WorkingDirectory (Split-Path $ComponentConfig.File) -WindowStyle Hidden }
+        'cmd' { Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', 'call', ('"{0}"' -f $ComponentConfig.File)) -WorkingDirectory (Split-Path $ComponentConfig.File) -WindowStyle Hidden }
+        'powershell' { Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ComponentConfig.File)) -WorkingDirectory (Split-Path $ComponentConfig.File) -WindowStyle Hidden }
     }
 }
 
@@ -193,7 +246,7 @@ function Start-DockerProjects {
         if (-not (Test-Path -LiteralPath $project.Path)) { Write-Warning "$($project.Name): Compose file not found"; continue }
         $arguments = @('compose')
         if ($project.EnvFile -and (Test-Path -LiteralPath $project.EnvFile)) { $arguments += @('--env-file', $project.EnvFile) }
-        $arguments += @('-f', $project.Path, 'up', '-d') + $project.Services
+        $arguments += @('-f', $project.Path, 'up', '-d', '--wait') + $project.Services
         Write-Host "Starting Docker: $($project.Name)..." -ForegroundColor Cyan
         & docker @arguments
     }
@@ -242,7 +295,7 @@ function Restart-SillyTavern {
         Write-Host "$($sillyTavern.Name): not running; starting it." -ForegroundColor Yellow
     }
 
-    Start-Component $sillyTavern
+    Start-Component -ComponentConfig $sillyTavern
     Wait-ForPort $sillyTavern.Name $sillyTavern.Port $sillyTavern.TimeoutSeconds
 }
 
@@ -254,7 +307,7 @@ function Stop-DockerProjects {
         Write-Host "Stopping Docker: $($project.Name)..." -ForegroundColor Cyan
         $arguments = @('compose')
         if ($project.EnvFile -and (Test-Path -LiteralPath $project.EnvFile)) { $arguments += @('--env-file', $project.EnvFile) }
-        $arguments += @('-f', $project.Path, 'down')
+        $arguments += @('-f', $project.Path, 'stop')
         & docker @arguments
     }
     for ($index = $DockerContainers.Count - 1; $index -ge 0; $index--) {
@@ -265,20 +318,115 @@ function Stop-DockerProjects {
     }
 }
 
+function Stop-Component($component) {
+    $listenerPid = Get-PortProcess $component.Port
+    if (-not $listenerPid) {
+        Write-Host "$($component.Name): not running." -ForegroundColor Yellow
+        return
+    }
+    $process = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
+    Write-Host "Stopping $($component.Name) (PID ${listenerPid}: $($process.ProcessName))..." -ForegroundColor Cyan
+    Stop-Process -Id $listenerPid -Force
+}
+
+function Wait-ForPortClosed([string] $Name, [int] $Port, [int] $TimeoutSeconds) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-PortProcess $Port)) { return }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "$Name did not release port $Port within $TimeoutSeconds seconds."
+}
+
+function Get-ComposeArguments($project, [string[]] $Command) {
+    $arguments = @('compose')
+    if ($project.EnvFile -and (Test-Path -LiteralPath $project.EnvFile)) { $arguments += @('--env-file', $project.EnvFile) }
+    return $arguments + @('-f', $project.Path) + $Command
+}
+
+# -Component で指定できるのは $Components / $DockerContainers / $DockerProjects に定義された名前だけ。
+function Invoke-ComponentAction([string] $Name, [string] $Operation) {
+    $process = $Components | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    $container = $DockerContainers | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    $project = $DockerProjects | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
+    if (-not ($process -or $container -or $project)) { throw "Unknown component: $Name" }
+
+    if ($process) {
+        if ($Operation -in @('stop', 'restart')) {
+            Stop-Component $process
+            Wait-ForPortClosed $process.Name $process.Port 30
+        }
+        if ($Operation -in @('start', 'restart')) {
+            if ($process.Name -eq 'Rino Agent Service') { Test-RinoAgentEnvironment }
+            if ($process.Name -eq 'Rino Life API') { & (Join-Path $Root 'Initialize-RinoLife.ps1') }
+            Start-Component -ComponentConfig $process
+            Wait-ForPort $process.Name $process.Port $process.TimeoutSeconds
+        }
+        return
+    }
+
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker CLI is unavailable. Start Docker Desktop first.' }
+    if ($container) {
+        if (-not (Get-DockerContainerState $container.Container)) { throw "Docker container not found: $($container.Container)" }
+        if ($Operation -in @('stop', 'restart')) { & docker stop $container.Container; if ($LASTEXITCODE -ne 0) { throw "docker stop failed: $($container.Name)" } }
+        if ($Operation -in @('start', 'restart')) {
+            & docker start $container.Container
+            if ($LASTEXITCODE -ne 0) { throw "docker start failed: $($container.Name)" }
+            Wait-ForPort $container.Name $container.Port $container.TimeoutSeconds
+        }
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $project.Path)) { throw "$($project.Name): Compose file not found" }
+    if ($Operation -in @('stop', 'restart')) {
+        & docker @(Get-ComposeArguments $project @('stop'))
+        if ($LASTEXITCODE -ne 0) { throw "docker compose stop failed: $($project.Name)" }
+    }
+    if ($Operation -in @('start', 'restart')) {
+        & docker @(Get-ComposeArguments $project (@('up', '-d', '--wait') + $project.Services))
+        if ($LASTEXITCODE -ne 0) { throw "docker compose up failed: $($project.Name)" }
+    }
+}
+
+if ($ComponentName -or $Action) {
+    if (-not ($ComponentName -and $Action)) { throw '-Component and -Action must be specified together.' }
+    Invoke-ComponentAction $ComponentName $Action
+    exit 0
+}
+if ($Status -and $Json) { ConvertTo-Json -InputObject @(Get-MaidAIStatus) -Depth 3; exit 0 }
 if ($Status) { Show-Status; exit }
 if ($Stop) { Stop-Components; exit }
 if ($RestartSillyTavern) { Restart-SillyTavern; exit }
 
 switch ($Profile) {
-    'chat' { $selected = @($Components[0], $Components[1], $Components[3], $Components[2]) }
-    'voice' { $selected = @($Components[3], $Components[4]) }
-    'full' { $selected = $Components }
+    'chat' { $selectedNames = @('KoboldCpp (Gemma 4)', 'SillyTavern', 'Rino Life API', 'Rino Agent Service') }
+    'voice' { $selectedNames = @('RVC API', 'EdgeTTS') }
+    'full' { $selectedNames = @('KoboldCpp (Gemma 4)', 'SillyTavern', 'Rino Life API', 'Rino Agent Service', 'RVC API', 'EdgeTTS') }
     'docker' { $selected = @() }
+}
+if ($Profile -ne 'docker') {
+    # Hashtable をパイプライン出力で配列化すると値だけに展開される場合があるため、
+    # 明示的な List に構成オブジェクトそのものを追加する。
+    $selected = [System.Collections.Generic.List[object]]::new()
+    foreach ($selectedName in $selectedNames) {
+        $matchedComponent = $null
+        foreach ($candidate in $Components) {
+            if ($candidate['Name'] -eq $selectedName) {
+                $matchedComponent = $candidate
+                break
+            }
+        }
+        if ($null -eq $matchedComponent) { throw "Component configuration not found: $selectedName" }
+        [void] $selected.Add($matchedComponent)
+    }
 }
 if ($selected | Where-Object { $_.Name -eq 'Rino Agent Service' }) { Test-RinoAgentEnvironment }
 if ($Profile -in @('chat', 'full', 'docker')) { Start-DockerProjects }
+if ($selected | Where-Object { $_.Name -eq 'Rino Life API' }) {
+    & (Join-Path $Root 'Initialize-RinoLife.ps1')
+}
 foreach ($component in $selected) {
-    Start-Component $component
+    Start-Component -ComponentConfig $component
     Wait-ForPort $component.Name $component.Port $component.TimeoutSeconds
 }
 Show-Status

@@ -12,6 +12,7 @@ MaidAI は、ローカルで動作する梨乃の会話 UI、Agent、安全な�
 | `rino_mcp/` | SwitchBot / OBS / ComfyUI / Windows の MCP サーバー |
 | `rino_life/` | 生活イベント、消耗品、PC 監視、通知、PostgreSQL / NATS 連携 |
 | `rino_event_bus/` | TypeScript 製ローカルイベントバス |
+| `rino_launcher/` | 起動ハブ（`Start-MaidAI.ps1`）を操作する PySide6 デスクトップウィジェット。サービス定義は持たない |
 | `contracts/` | バージョン付きイベント JSON Schema |
 | `infra/` | Rino Life 用 Docker Compose と環境設定 |
 | `docs/` | 利用者向け案内、設計、運用資料。入口は `docs/README.md` |

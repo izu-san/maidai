@@ -1,29 +1,30 @@
 # Rino Life
 
+Rino Life の初期化には `requirements-rino-agent.txt` の Python 依存関係が必要です。未導入の環境では先に `py -3.13 -m pip install -r requirements-rino-agent.txt` を実行してください。
+
 ## Phase 1 SwitchBot observations
 
 `SwitchBotNatsBridge` transfers only versioned SwitchBot observations from the local Event Bus to JetStream. It preserves IDs, reconnects via the NATS client, and never subscribes to NATS, so it cannot form a loop. `EnvironmentStateStore` atomically writes a processed-event marker, history, and newest per-device snapshot. SwitchBot MCP commands remain on the existing Policy / Approval / Audit path.
 
 1. Copy `infra/.env.life.example` to `infra/.env.life` and replace both passwords with different random values.
-2. Start the infrastructure with `./Start-MaidAI.ps1 -Profile docker` (or `docker compose --env-file infra/.env.life -f infra/compose.life.yaml up -d`).
-3. Set `RINO_LIFE_DATABASE_URL` to `postgresql+psycopg://<user>:<password>@127.0.0.1:<port>/<database>` and run `python -m alembic upgrade head`.
-4. Set `RINO_LIFE_NATS_URL` to `nats://<user>:<password>@127.0.0.1:<port>` and run `python -m rino_life.nats_setup`.
+2. Run `./Start-MaidAI.ps1` for the normal chat profile. It starts Compose with health checks, derives the private connection URLs from `infra/.env.life`, then idempotently runs migration, seed, and JetStream setup before starting the Life API and Agent.
+3. Use `./Start-MaidAI.ps1 -Profile docker` when only PostgreSQL / NATS are needed. In that case run `./Initialize-RinoLife.ps1` from the same PowerShell session before starting Life Python processes manually.
 
-The last two commands are idempotent. `python tools/verify_life_phase0.py assert-ready` confirms the three streams and durable pull consumer. Do not use the example credentials outside a disposable local verification.
+`Initialize-RinoLife.ps1` is idempotent and URI-escapes credentials when it derives `RINO_LIFE_DATABASE_URL` and `RINO_LIFE_NATS_URL`; explicit values remain supported as overrides. `python tools/verify_life_phase0.py assert-ready` confirms the three streams and durable pull consumer. Do not use the example credentials outside a disposable local verification.
 
 ## Phase 2 consumables
 
-Run `python -m alembic upgrade head`, then seed the two MVP items:
+The normal hub profile runs migration and seeds the two MVP items automatically. For a manual setup, run `./Initialize-RinoLife.ps1` first.
 
 ```powershell
 py -3.13 -c "from rino_life.consumables import ConsumableService; ConsumableService().seed()"
 ```
 
-Start the API with `py -3.13 -m uvicorn rino_life.api:app --host 127.0.0.1 --port 54330` and the publisher with `py -3.13 -m rino_life.outbox`. `POST /events` is the only state-write boundary: it validates the event and writes history, snapshot, and Outbox row in one transaction. The LLM-facing `LifeTools` facade has no database or NATS handle.
+Start the API with `py -3.13 -m uvicorn rino_life.api:app --host 127.0.0.1 --port 54330`. Its lifespan owns the outbox publisher and the notification, environment, PC-state, and Vision consumers. `POST /events` is the only state-write boundary: it validates the event and writes history, snapshot, and Outbox row in one transaction. The LLM-facing `LifeTools` facade has no database or NATS handle.
 
 ## Agent integration
 
-`rino_agent/config/mcp.yaml` enables the private `rino-life` stdio MCP by default. Its fixed consumable and laundry tools call the loopback Life API (`RINO_LIFE_API_URL`, default `http://127.0.0.1:54330`) and cannot access PostgreSQL or NATS directly. `Start-MaidAI.ps1` starts the Life API before the Agent in `chat` and `full` profiles; migrate and seed the database first. This connection enables user-requested life records and queries only. PC monitor and notification-router outputs are still recorded/routed inside Rino Life and are not automatically delivered to the chat UI.
+`rino_agent/config/mcp.yaml` enables the private `rino-life` stdio MCP by default. Its fixed consumable and laundry tools call the loopback Life API (`RINO_LIFE_API_URL`, default `http://127.0.0.1:54330`) and cannot access PostgreSQL or NATS directly. `Start-MaidAI.ps1` starts the Life API before the Agent in `chat` and `full` profiles. This connection enables user-requested life records and queries only. PC monitor and notification-router outputs are still recorded/routed inside Rino Life and are not automatically delivered to the chat UI.
 
 ## Phase 4 PC / Vision / routine
 
@@ -31,4 +32,4 @@ Start the API with `py -3.13 -m uvicorn rino_life.api:app --host 127.0.0.1 --por
 
 ## Phase 3 notifications
 
-Run `py -3.13 -m alembic upgrade head`, then start `py -3.13 -m rino_life.notifications`. Low-stock candidates are written in the same transaction as the consumable snapshot and are routed by the durable `life-notification-router-v1` consumer. Each decision (sent, aggregated, cooldown/quiet-hours suppression, acknowledgement, and resolution) is retained in `notification_history.reason`; notification delivery itself remains an injected adapter, rather than direct Agent execution.
+The normal hub starts the notification router with the Life API. Low-stock candidates are written in the same transaction as the consumable snapshot and are routed by the durable `life-notification-router-v1` consumer. Each decision (sent, aggregated, cooldown/quiet-hours suppression, acknowledgement, and resolution) is retained in `notification_history.reason`; notification delivery itself remains an injected adapter, rather than direct Agent execution.

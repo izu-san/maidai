@@ -6,7 +6,12 @@ from sqlalchemy import engine_from_config, pool
 
 config = context.config
 if os.environ.get("RINO_LIFE_DATABASE_URL"):
-    config.set_main_option("sqlalchemy.url", os.environ["RINO_LIFE_DATABASE_URL"])
+    database_url = os.environ["RINO_LIFE_DATABASE_URL"]
+    # Application code uses psycopg directly and therefore keeps a standard
+    # PostgreSQL DSN.  SQLAlchemy requires an explicit psycopg dialect here.
+    if database_url.startswith("postgresql://"):
+        database_url = "postgresql+psycopg://" + database_url.removeprefix("postgresql://")
+    config.set_main_option("sqlalchemy.url", database_url)
 if config.config_file_name:
     fileConfig(config.config_file_name)
 
