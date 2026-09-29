@@ -15,6 +15,8 @@ STREAMS = (
 CONSUMER = ConsumerConfig(durable_name="life-phase0-contract-checker-v1", filter_subject="life.>", ack_policy="explicit", ack_wait=30, max_deliver=5, deliver_policy=DeliverPolicy.ALL)
 ENVIRONMENT_CONSUMER = ConsumerConfig(durable_name="life-environment-state-v1", filter_subject="switchbot.>", ack_policy="explicit", ack_wait=30, max_deliver=5, deliver_policy=DeliverPolicy.ALL)
 NOTIFICATION_CONSUMER = ConsumerConfig(durable_name="life-notification-router-v1", filter_subject="life.consumable.low.v1", ack_policy="explicit", ack_wait=30, max_deliver=5, deliver_policy=DeliverPolicy.ALL)
+PC_NOTIFICATION_CONSUMER = ConsumerConfig(durable_name="life-notification-pc-v1", filter_subject="pc.>", ack_policy="explicit", ack_wait=30, max_deliver=5, deliver_policy=DeliverPolicy.ALL)
+SWITCHBOT_NOTIFICATION_CONSUMER = ConsumerConfig(durable_name="life-notification-switchbot-v1", filter_subject="switchbot.>", ack_policy="explicit", ack_wait=30, max_deliver=5, deliver_policy=DeliverPolicy.NEW)
 PC_CONSUMER = ConsumerConfig(durable_name="life-pc-state-v1", filter_subject="pc.>", ack_policy="explicit", ack_wait=30, max_deliver=5, deliver_policy=DeliverPolicy.ALL)
 VISION_CONSUMER = ConsumerConfig(durable_name="life-vision-candidates-v1", filter_subject="vision.>", ack_policy="explicit", ack_wait=30, max_deliver=5, deliver_policy=DeliverPolicy.ALL)
 
@@ -30,7 +32,7 @@ async def ensure_jetstream(url: str | None = None) -> None:
                 if "already in use" not in str(error).lower():
                     raise
                 await js.update_stream(config)
-        for stream, consumer in (("RINO_LIFE", CONSUMER), ("RINO_LIFE", NOTIFICATION_CONSUMER), ("RINO_DEVICE", ENVIRONMENT_CONSUMER), ("RINO_DEVICE", PC_CONSUMER), ("RINO_DEVICE", VISION_CONSUMER)):
+        for stream, consumer in (("RINO_LIFE", CONSUMER), ("RINO_LIFE", NOTIFICATION_CONSUMER), ("RINO_DEVICE", ENVIRONMENT_CONSUMER), ("RINO_DEVICE", PC_CONSUMER), ("RINO_DEVICE", PC_NOTIFICATION_CONSUMER), ("RINO_DEVICE", SWITCHBOT_NOTIFICATION_CONSUMER), ("RINO_DEVICE", VISION_CONSUMER)):
             try:
                 await js.add_consumer(stream, consumer)
             except Exception as error:

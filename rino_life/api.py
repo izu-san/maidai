@@ -14,17 +14,19 @@ from .finance import FinanceService
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # The API owns the host-resident Life workers.  They only consume/publish
-    # versioned NATS events; notification delivery remains the injected no-op
-    # adapter and never triggers Agent actions.
+    # versioned NATS events; notifications are only queued for display in the chat
+    # inbox and never trigger Agent actions.  The PC health and SwitchBot
+    # observation producers run here too, so no separately started producer is needed.
     from .daily_usage import run_daily_usage
     from .environment_consumer import run_environment_consumer
     from .notifications import run_notification_router
     from .outbox import run_outbox_publisher
-    from .pc import run_pc_consumer
+    from .pc import run_pc_consumer, run_pc_monitor
+    from .switchbot_monitor import run_switchbot_monitor
     from .vision import run_vision_consumer
     tasks = [asyncio.create_task(worker()) for worker in (
         run_outbox_publisher, run_notification_router, run_environment_consumer,
-        run_pc_consumer, run_vision_consumer, run_daily_usage,
+        run_pc_consumer, run_pc_monitor, run_switchbot_monitor, run_vision_consumer, run_daily_usage,
     )]
     try:
         yield

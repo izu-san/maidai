@@ -41,3 +41,64 @@ def test_urgent_pc_error_bypasses_quiet_hours_but_normal_alert_does_not():
     now = datetime(2026, 9, 29, 15, tzinfo=timezone.utc)
     assert decide_notification(None, now=now, priority=4, quiet=True, confidence=1, cooldown=timedelta(hours=1)).action == "send"
     assert decide_notification(None, now=now, priority=2, quiet=True, confidence=1, cooldown=timedelta(hours=1)).action == "suppress"
+
+def _service_psutil(status):
+    class Service:
+        def status(self): return status["value"]
+    class Psutil:
+        def win_service_get(self, name):
+            if name == "missing": raise OSError("not installed")
+            return Service()
+    return Psutil()
+
+def test_stopped_watched_service_emits_service_failed_after_debounce_and_recovers():
+    status = {"value": "stopped"}
+    monitor = PCMonitor(device_id="pc-1", psutil_module=_service_psutil(status), watched_services=("EventLog", "missing"))
+    assert monitor.observe_services() == []
+    event = monitor.observe_services()[0]
+    assert event["type"] == "pc.service_failed.v1" and event["payload"]["service"] == "EventLog"
+    assert validate_event(event["type"], event).payload["device_id"] == "pc-1"
+    assert monitor.observe_services() == []
+    status["value"] = "running"; assert monitor.observe_services() == []
+    status["value"] = "stopped"; monitor.observe_services(); assert monitor.observe_services()
+
+def test_hardware_errors_skip_startup_history_then_emit_only_new_records():
+    log = [{"provider": "disk", "event_id": 7, "record_id": 10}]
+    queries = []
+    def fake(after):
+        queries.append(after); return [item for item in log if after is None or item["record_id"] > after]
+    monitor = PCMonitor(device_id="pc-1", hardware_events=fake)
+    assert monitor.observe_hardware() == []
+    assert monitor.observe_hardware() == []
+    log.append({"provider": "Ntfs", "event_id": 55, "record_id": 11})
+    events = monitor.observe_hardware()
+    assert [e["payload"]["code"] for e in events] == ["Ntfs:55"] and queries == [None, 10, 10]
+    assert validate_event(events[0]["type"], events[0]).type == "pc.hardware_error.v1"
+    assert monitor.observe_hardware() == []
+
+def test_hardware_query_failure_does_not_stop_other_pc_alerts():
+    def broken(_): raise RuntimeError("wevtutil failed")
+    class Psutil:
+        def cpu_percent(self, interval=None): return 1
+        def virtual_memory(self): return SimpleNamespace(percent=1, available=9, total=100)
+    monitor = PCMonitor(device_id="pc-1", psutil_module=Psutil(), watched_services=(), hardware_events=broken,
+                        disk_usage=lambda _: SimpleNamespace(free=50, total=100), storage_threshold_bytes=20)
+    assert monitor.observe("C:/") == []
+
+def test_monitor_publishes_started_first_and_api_hosts_the_monitor():
+    import asyncio, json
+    published = []
+    async def publish(subject, data): published.append((subject, json.loads(data)))
+    class Stop(Exception): pass
+    async def sleep(_): raise Stop
+    monitor = PCMonitor(device_id="pc-1", watched_services=(), hardware_events=lambda _: [],
+                        disk_usage=lambda _: SimpleNamespace(free=10, total=100), storage_threshold_bytes=20,
+                        psutil_module=SimpleNamespace(cpu_percent=lambda interval=None: 1, virtual_memory=lambda: SimpleNamespace(percent=1, available=9, total=100)))
+    import rino_life.pc as pc
+    original, pc.asyncio.sleep = pc.asyncio.sleep, sleep
+    try:
+        with pytest.raises(Stop): asyncio.run(monitor.run(publish, "C:/"))
+    finally: pc.asyncio.sleep = original
+    assert published[0][0] == "pc.started.v1" and validate_event(*published[0])
+    from pathlib import Path
+    assert "run_pc_monitor" in (Path(__file__).parent.parent / "rino_life" / "api.py").read_text(encoding="utf-8")

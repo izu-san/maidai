@@ -12,3 +12,5 @@ Finance ledger events use `life.finance.transaction_recorded.v1`,
 facts and never include payment credentials, bank data, or conversation text.
 
 `life.consumable.daily_consumed.v1` (payload `{"date": "YYYY-MM-DD"}`, Japan date) is emitted by the Life service itself to deduct `PER_DAY` consumables up to that date. It is idempotent per date and is not exposed to Agent tools.
+
+`switchbot.device_state_changed.v1` from the Life SwitchBot poller uses `device_type: "lock"` with `state` = `{lock_state, door_state, unlocked_minutes?, open_minutes?}` (`state` is a free-form object in the schema; the notification router reads these keys). Observations use registry keys (`environment`, `entrance`) as `device_id`, not real SwitchBot device IDs.

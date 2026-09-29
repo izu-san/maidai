@@ -5,12 +5,14 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 import json, logging, os
 from typing import Any, Callable
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from .contracts import LifeEventEnvelope, validate_event
 
 LOG = logging.getLogger(__name__)
 CONSUMER_NAME = "life-notification-router-v1"
+PC_CONSUMER_NAME = "life-notification-pc-v1"
+SWITCHBOT_CONSUMER_NAME = "life-notification-switchbot-v1"
 
 @dataclass(frozen=True)
 class NotificationDecision:
@@ -36,6 +38,36 @@ def decide_notification(existing: dict[str, Any] | None, *, now: datetime, prior
         return NotificationDecision("suppress", {"rule": "cooldown", "cooldown_until": until.isoformat()})
     return NotificationDecision("send", {"rule": "eligible", "cooldown_seconds": int(cooldown.total_seconds())})
 
+# SwitchBot alert rules: kind -> (limit, priority).  Comfort alerts (priority 2) stay quiet at night;
+# temperature extremes and entrance faults (priority 3) do not.
+SWITCHBOT_ALERTS: dict[str, tuple[float, int]] = {
+    "co2_high": (1100, 2), "temperature_high": (29.0, 3), "temperature_low": (10.0, 3),
+    "humidity_low": (30.0, 2), "humidity_high": (70.0, 2),
+    "door_unlocked": (30, 3), "door_open": (30, 3), "lock_jammed": (0, 3),
+}
+_SWITCHBOT_METRIC_KINDS = {
+    "switchbot.co2_changed.v1": ("co2_ppm", ("co2_high",)),
+    "switchbot.temperature_changed.v1": ("temperature_c", ("temperature_high", "temperature_low")),
+    "switchbot.humidity_changed.v1": ("humidity_percent", ("humidity_low", "humidity_high")),
+}
+
+def evaluate_switchbot(event: LifeEventEnvelope) -> tuple[dict[str, bool], dict[str, Any]]:
+    """Return {alert kind: breached} for the event and the payload extras (value, limit) used in messages."""
+    payload = event.payload
+    if event.type in _SWITCHBOT_METRIC_KINDS:
+        field, kinds = _SWITCHBOT_METRIC_KINDS[event.type]
+        value = payload[field]
+        breached = {"co2_high": value >= SWITCHBOT_ALERTS["co2_high"][0], "temperature_high": value >= SWITCHBOT_ALERTS["temperature_high"][0],
+                    "temperature_low": value <= SWITCHBOT_ALERTS["temperature_low"][0], "humidity_low": value <= SWITCHBOT_ALERTS["humidity_low"][0],
+                    "humidity_high": value >= SWITCHBOT_ALERTS["humidity_high"][0]}
+        return {kind: breached[kind] for kind in kinds}, {"value": value}
+    if event.type == "switchbot.device_state_changed.v1" and payload.get("device_type") == "lock":
+        state = payload["state"]
+        return ({"door_unlocked": state.get("lock_state") == "UNLOCKED" and state.get("unlocked_minutes", 0) >= SWITCHBOT_ALERTS["door_unlocked"][0],
+                 "door_open": state.get("door_state") == "OPEN" and state.get("open_minutes", 0) >= SWITCHBOT_ALERTS["door_open"][0],
+                 "lock_jammed": state.get("lock_state") == "JAMMED"}, {"state": state})
+    return {}, {}
+
 class NotificationRouter:
     def __init__(self, dsn: str | None = None, connect: Callable[..., Any] | None = None,
                  *, cooldown: timedelta = timedelta(hours=12), notifier: Callable[[dict[str, Any]], None] | None = None):
@@ -47,15 +79,18 @@ class NotificationRouter:
         self.connect, self.cooldown, self.notifier = connect, cooldown, notifier or (lambda _: None)
 
     def route(self, event: LifeEventEnvelope, *, now: datetime | None = None) -> NotificationDecision:
-        priorities = {"life.consumable.low.v1": 2, "pc.storage_low.v1": 3, "pc.hardware_error.v1": 4, "pc.service_failed.v1": 3}
+        if event.type.startswith("switchbot."): return self._route_switchbot(event, now=now)
+        priorities = {"life.consumable.low.v1": 2, "pc.storage_low.v1": 3, "pc.cpu_high.v1": 2, "pc.memory_high.v1": 2, "pc.hardware_error.v1": 4, "pc.service_failed.v1": 3}
         if event.type not in priorities:
             return NotificationDecision("ignore", {"rule": "unsupported_subject"})
-        now = now or datetime.now(timezone.utc)
         payload = event.payload
         key = f"consumable-low:{payload['item_id']}" if event.type == "life.consumable.low.v1" else f"{event.type}:{payload['device_id']}:{payload.get('path', payload.get('code', payload.get('service', 'default')))}"
-        priority = priorities[event.type]
+        return self._route(event, key=key, priority=priorities[event.type], payload=payload, now=now)
+
+    def _route(self, event: LifeEventEnvelope, *, key: str, priority: int, payload: dict[str, Any], now: datetime | None, marker: UUID | None = None) -> NotificationDecision:
+        now = now or datetime.now(timezone.utc)
         with self.connect(self.dsn) as connection, connection.cursor() as cursor:
-            cursor.execute("INSERT INTO processed_events (consumer_name,event_id) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING event_id", (CONSUMER_NAME, event.id))
+            cursor.execute("INSERT INTO processed_events (consumer_name,event_id) VALUES (%s,%s) ON CONFLICT DO NOTHING RETURNING event_id", (CONSUMER_NAME, marker or event.id))
             if cursor.fetchone() is None:
                 return NotificationDecision("suppress", {"rule": "duplicate_event"})
             cursor.execute("SELECT id,status,cooldown_until,candidate_count FROM notification_history WHERE dedupe_key=%s FOR UPDATE", (key,))
@@ -75,6 +110,19 @@ class NotificationRouter:
             self.notifier({"dedupe_key": key, "priority": priority, "payload": payload, "reason": reason})
         return decision
 
+    def _route_switchbot(self, event: LifeEventEnvelope, *, now: datetime | None) -> NotificationDecision:
+        breached, extras = evaluate_switchbot(event)
+        if not breached: return NotificationDecision("ignore", {"rule": "unsupported_subject"})
+        device = event.payload.get("device_id") or "switchbot-default"
+        decision = NotificationDecision("ignore", {"rule": "within_range"})
+        for kind, is_breached in breached.items():
+            key = f"switchbot.{kind}:{device}"
+            if not is_breached:
+                self.resolve(key, now=now)  # recovery re-arms the alert (the cooldown still applies)
+                continue
+            decision = self._route(event, key=key, priority=SWITCHBOT_ALERTS[kind][1], payload={**event.payload, **extras, "kind": kind, "limit": SWITCHBOT_ALERTS[kind][0]}, now=now, marker=uuid5(event.id, key))
+        return decision
+
     def acknowledge(self, dedupe_key: str, *, now: datetime | None = None) -> bool:
         return self._set_status(dedupe_key, "acknowledged", "acknowledged_at", now)
 
@@ -91,15 +139,25 @@ async def run_notification_router(router: NotificationRouter | None = None, url:
     from .agent_notifier import agent_chat_notifier
     router = router or NotificationRouter(notifier=agent_chat_notifier)
     nc = await nats.connect(url or os.environ.get("RINO_LIFE_NATS_URL", "nats://127.0.0.1:54222"))
-    try:
-        sub = await nc.jetstream().pull_subscribe("life.consumable.low.v1", durable=CONSUMER_NAME, stream="RINO_LIFE")
+
+    async def consume(subject: str, durable: str, stream: str) -> None:
+        sub = await nc.jetstream().pull_subscribe(subject, durable=durable, stream=stream)
         while True:
-            for message in await sub.fetch(10, timeout=1):
+            try:
+                messages = await sub.fetch(10, timeout=1)
+            except asyncio.TimeoutError:
+                continue
+            for message in messages:
                 try:
                     router.route(validate_event(message.subject, json.loads(message.data)))
                     await message.ack()
                 except Exception:
                     LOG.exception("notification consumer failed", extra={"subject": message.subject})
+
+    try:
+        await asyncio.gather(consume("life.consumable.low.v1", CONSUMER_NAME, "RINO_LIFE"),
+                             consume("pc.>", PC_CONSUMER_NAME, "RINO_DEVICE"),
+                             consume("switchbot.>", SWITCHBOT_CONSUMER_NAME, "RINO_DEVICE"))
     finally:
         await nc.drain()
 
