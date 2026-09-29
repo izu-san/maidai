@@ -8,6 +8,7 @@
     .\Start-MaidAI.ps1 -RestartSillyTavern
     .\Start-MaidAI.ps1 -Status -Json   # 機械可読な状態（デスクトップウィジェットが使用）
     .\Start-MaidAI.ps1 -Component 'SillyTavern' -Action restart   # 個別の起動 / 停止 / 再起動
+    .\Start-MaidAI.ps1 -Component 'SillyTavern' -Action log       # ログファイルのパスを出力（Docker は docker logs を書き出す）
 
   Docker のサービスは下部の $DockerProjects と $DockerContainers で管理する。
 #>
@@ -20,7 +21,7 @@ param(
     [switch] $RestartSillyTavern,
     [Alias('Component')]
     [string] $ComponentName,
-    [ValidateSet('start', 'stop', 'restart')]
+    [ValidateSet('start', 'stop', 'restart', 'log')]
     [string] $Action,
     [switch] $Json
 )
@@ -91,14 +92,67 @@ $DockerContainers = @(
     @{ Name = 'SearXNG'; Container = 'searxng'; Port = 8888; TimeoutSeconds = 120 }
 )
 
+# Health は稼働中に応答を確認する loopback の URL（応答がなければウィジェットが「応答異常」と表示する）。
+# OpenUrl はウィジェットが既定ブラウザで開く loopback の URL。
 $Components = @(
-    @{ Name = 'KoboldCpp (Gemma 4)'; Port = 5001; TimeoutSeconds = 600; Kind = 'exe'; File = (Join-Path $Root 'koboldcpp\koboldcpp.exe'); Args = @('--config', (Join-Path $Root 'koboldcpp\Gemma4.kcpps')) },
-    @{ Name = 'SillyTavern'; Port = 8000; TimeoutSeconds = 120; Kind = 'cmd'; File = (Join-Path $Root 'SillyTavern\Start.bat'); Args = @() },
-    @{ Name = 'Rino Agent Service'; Port = 8766; TimeoutSeconds = 30; Kind = 'cmd'; File = (Join-Path $Root 'rino_agent\Start-AgentService.cmd'); Args = @() },
-    @{ Name = 'Rino Life API'; Port = 54330; TimeoutSeconds = 30; Kind = 'cmd'; File = (Join-Path $Root 'rino_life\Start-LifeApi.cmd'); Args = @() },
+    @{ Name = 'KoboldCpp (Gemma 4)'; Port = 5001; TimeoutSeconds = 600; Kind = 'exe'; File = (Join-Path $Root 'koboldcpp\koboldcpp.exe'); Args = @('--config', (Join-Path $Root 'koboldcpp\Gemma4.kcpps')); Health = 'http://127.0.0.1:5001/api/v1/model' },
+    @{ Name = 'SillyTavern'; Port = 8000; TimeoutSeconds = 120; Kind = 'cmd'; File = (Join-Path $Root 'SillyTavern\Start.bat'); Args = @(); Health = 'http://127.0.0.1:8000/'; OpenUrl = 'http://127.0.0.1:8000/' },
+    @{ Name = 'Rino Agent Service'; Port = 8766; TimeoutSeconds = 30; Kind = 'cmd'; File = (Join-Path $Root 'rino_agent\Start-AgentService.cmd'); Args = @(); Health = 'http://127.0.0.1:8766/health' },
+    @{ Name = 'Rino Life API'; Port = 54330; TimeoutSeconds = 30; Kind = 'cmd'; File = (Join-Path $Root 'rino_life\Start-LifeApi.cmd'); Args = @(); Health = 'http://127.0.0.1:54330/health' },
     @{ Name = 'RVC API'; Port = 5050; TimeoutSeconds = 120; Kind = 'cmd'; File = (Join-Path $Root 'rvc-python\Start-RVC.cmd'); Args = @() },
     @{ Name = 'EdgeTTS'; Port = 5100; TimeoutSeconds = 60; Kind = 'cmd'; File = (Join-Path $Root 'SillyTavern-extras\Start-Edge-TTS.cmd'); Args = @() }
 )
+
+# プロファイル定義。起動対象と、状態 JSON の profiles 項目（ウィジェットのプロファイル充足表示）の唯一の出所。
+# Docker（Compose プロジェクトと DockerContainers 全部）は $DockerProfiles のプロファイルでのみ起動する。
+$ProfileComponents = @{
+    chat   = @('KoboldCpp (Gemma 4)', 'SillyTavern', 'Rino Life API', 'Rino Agent Service')
+    voice  = @('RVC API', 'EdgeTTS')
+    full   = @('KoboldCpp (Gemma 4)', 'SillyTavern', 'Rino Life API', 'Rino Agent Service', 'RVC API', 'EdgeTTS')
+    docker = @()
+}
+$DockerProfiles = @('chat', 'full', 'docker')
+$LogDir = Join-Path $Root 'logs\services'
+
+function Get-ProfilesOf([string] $Name, [bool] $IsDocker) {
+    $result = @()
+    foreach ($profileName in @('chat', 'voice', 'full', 'docker')) {
+        if ($IsDocker) { if ($DockerProfiles -contains $profileName) { $result += $profileName } }
+        elseif ($ProfileComponents[$profileName] -contains $Name) { $result += $profileName }
+    }
+    return $result
+}
+
+function Get-LogPath([string] $Name) {
+    $slug = ($Name.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+    return (Join-Path $LogDir "$slug.log")
+}
+
+# サービスのログが 5MB を超えていたら .old.log へ退避してから追記を始める。
+function Initialize-ServiceLog([string] $Name) {
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $path = Get-LogPath $Name
+    if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 5MB) {
+        Move-Item -LiteralPath $path -Destination ($path -replace '\.log$', '.old.log') -Force
+    }
+    return $path
+}
+
+# loopback の HTTP 応答を確認する。2xx/3xx と 401/403（認証付きで稼働中）を正常とみなす。
+function Test-HttpHealth([string] $Url) {
+    $client = $null
+    try {
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+        $client = [System.Net.Http.HttpClient]::new()
+        $client.Timeout = [TimeSpan]::FromMilliseconds(1500)
+        $code = [int] $client.GetAsync($Url).GetAwaiter().GetResult().StatusCode
+        return (($code -ge 200 -and $code -lt 400) -or $code -eq 401 -or $code -eq 403)
+    } catch {
+        return $false
+    } finally {
+        if ($client) { $client.Dispose() }
+    }
+}
 
 function Get-PortProcess([int] $Port) {
     if ($Port -le 0) { return $null }
@@ -133,44 +187,89 @@ function Wait-ForPort([string] $Name, [int] $Port, [int] $TimeoutSeconds) {
     throw "$Name did not become ready on port $Port within $TimeoutSeconds seconds."
 }
 
+# 時刻文字列（Docker の RFC3339 ナノ秒表記を含む）を UTC の ISO 8601 文字列にする。解釈不能・未起動（0001 年）は $null。
+function ConvertTo-UtcIso($Value) {
+    if ($null -eq $Value) { return $null }
+    $text = ([string] $Value).Trim() -replace '(\.\d{7})\d+', '$1'
+    $parsed = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse($text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref] $parsed)) { return $null }
+    if ($parsed.Year -lt 2000) { return $null }
+    return $parsed.UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
+function Get-ProcessStartedAt([int] $ProcessId) {
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        return ConvertTo-UtcIso $process.StartTime.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        return $null
+    }
+}
+
 # 状態を機械可読なオブジェクトで返す。state は running / loading / stopped / missing / unavailable。
 # kind は process（ローカルプロセス）/ container（Docker コンテナ）/ project（Compose プロジェクト）。
+# started_at は最終起動時刻（UTC ISO 8601、不明は null）。process は稼働中のリスナー、container は Docker の
+# State.StartedAt（停止中でも直近の起動時刻）、project はメンバーコンテナのうち最新の起動時刻。
+# health は稼働中の応答確認（ok / fail、確認手段がなければ null）。process は Health URL、container は Docker healthcheck、
+# project はメンバーに fail があれば fail。open_url はブラウザで開ける loopback URL（なければ null）。
+# profiles はそのコンポーネントを起動するプロファイル名の配列。
 function Get-MaidAIStatus {
     $items = @()
     foreach ($component in $Components) {
         $state = 'stopped'
         $listenerPid = $null
         $processName = $null
-        if ($component.Name -eq 'KoboldCpp (Gemma 4)' -and (Get-Process -Name 'koboldcpp' -ErrorAction SilentlyContinue) -and -not (Get-PortProcess $component.Port)) {
+        $startedAt = $null
+        $health = $null
+        $loadingProcess = if ($component.Name -eq 'KoboldCpp (Gemma 4)') { Get-Process -Name 'koboldcpp' -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+        if ($loadingProcess -and -not (Get-PortProcess $component.Port)) {
             $state = 'loading'
+            $startedAt = Get-ProcessStartedAt $loadingProcess.Id
         } else {
             $listenerPid = Get-PortProcess $component.Port
             if ($listenerPid) {
                 $state = 'running'
                 $processName = (Get-Process -Id $listenerPid -ErrorAction SilentlyContinue).ProcessName
+                $startedAt = Get-ProcessStartedAt $listenerPid
+                if ($component.Health) { $health = if (Test-HttpHealth $component.Health) { 'ok' } else { 'fail' } }
             }
         }
-        $items += [pscustomobject]@{ name = $component.Name; kind = 'process'; port = $component.Port; state = $state; pid = $listenerPid; process = $processName }
+        $openUrl = if ($component.OpenUrl) { $component.OpenUrl } else { $null }
+        $items += [pscustomobject]@{ name = $component.Name; kind = 'process'; port = $component.Port; state = $state; pid = $listenerPid; process = $processName; started_at = $startedAt; health = $health; open_url = $openUrl; profiles = @(Get-ProfilesOf $component.Name $false) }
     }
     $docker = Get-Command docker -ErrorAction SilentlyContinue
     $containerStates = @{}
+    $containerStarts = @{}
+    $containerHealth = @{}
     foreach ($container in $DockerContainers) {
         $state = 'unavailable'
+        $startedAt = $null
+        $health = $null
         if ($docker) {
-            $raw = Get-DockerContainerState $container.Container
+            $info = Get-DockerContainerInfo $container.Container
+            $raw = if ($info) { $info.Status } else { $null }
             $containerStates[$container.Container] = $raw
+            if ($info) { $startedAt = $info.StartedAt; $containerStarts[$container.Container] = $startedAt }
             $state = if ($raw -eq 'running') { 'running' } elseif ($raw) { 'stopped' } else { 'missing' }
+            if ($state -eq 'running' -and $info) { $health = $info.Health }
+            $containerHealth[$container.Container] = $health
         }
-        $items += [pscustomobject]@{ name = $container.Name; kind = 'container'; port = $container.Port; state = $state; pid = $null; process = $null }
+        $items += [pscustomobject]@{ name = $container.Name; kind = 'container'; port = $container.Port; state = $state; pid = $null; process = $null; started_at = $startedAt; health = $health; open_url = $null; profiles = @(Get-ProfilesOf $container.Name $true) }
     }
     foreach ($project in $DockerProjects) {
         $state = 'unavailable'
+        $startedAt = $null
+        $health = $null
         if ($docker) {
             $members = @($project.Containers)
             $running = @($members | Where-Object { $containerStates[$_] -eq 'running' })
             $state = if ($members.Count -and $running.Count -eq $members.Count) { 'running' } elseif ($running.Count) { 'loading' } else { 'stopped' }
+            # ISO 8601 UTC 固定書式なので文字列比較で最新を選べる
+            $startedAt = @($members | ForEach-Object { $containerStarts[$_] } | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1)[0]
+            if (@($members | Where-Object { $containerHealth[$_] -eq 'fail' }).Count) { $health = 'fail' }
+            elseif ($state -eq 'running' -and @($members | Where-Object { $containerHealth[$_] -eq 'ok' }).Count) { $health = 'ok' }
         }
-        $items += [pscustomobject]@{ name = $project.Name; kind = 'project'; port = 0; state = $state; pid = $null; process = $null }
+        $items += [pscustomobject]@{ name = $project.Name; kind = 'project'; port = 0; state = $state; pid = $null; process = $null; started_at = $startedAt; health = $health; open_url = $null; profiles = @(Get-ProfilesOf $project.Name $true) }
     }
     return $items
 }
@@ -198,18 +297,28 @@ function Show-Status {
     }
 }
 
-function Get-DockerContainerState([string] $ContainerName) {
+# status（running 等）と最終起動時刻（UTC, ISO 8601。未起動は $null）を返す。未作成は $null。
+function Get-DockerContainerInfo([string] $ContainerName) {
     # コンテナ未作成時の docker の stderr を、$ErrorActionPreference='Stop' 下で例外化させない
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $state = & docker container inspect --format '{{.State.Status}}' $ContainerName 2>$null
+        $line = & docker container inspect --format '{{.State.Status}}|{{.State.StartedAt}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' $ContainerName 2>$null
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previous
     }
-    if ($exitCode -ne 0 -or -not $state) { return $null }
-    return ([string]($state | Select-Object -First 1)).Trim()
+    if ($exitCode -ne 0 -or -not $line) { return $null }
+    $parts = ([string]($line | Select-Object -First 1)).Trim().Split('|', 3)
+    # Docker の healthcheck: healthy → ok、unhealthy → fail、未定義・starting は $null（判定しない）
+    $health = if ($parts.Count -gt 2) { switch ($parts[2]) { 'healthy' { 'ok' } 'unhealthy' { 'fail' } default { $null } } } else { $null }
+    return [pscustomobject]@{ Status = $parts[0]; StartedAt = ConvertTo-UtcIso $(if ($parts.Count -gt 1) { $parts[1] } else { $null }); Health = $health }
+}
+
+function Get-DockerContainerState([string] $ContainerName) {
+    $info = Get-DockerContainerInfo $ContainerName
+    if ($info -and $info.Status) { return $info.Status }
+    return $null
 }
 
 function Start-Component($ComponentConfig) {
@@ -230,9 +339,14 @@ function Start-Component($ComponentConfig) {
         return
     }
     Write-Host "Starting $($ComponentConfig.Name)..." -ForegroundColor Cyan
+    # 標準出力・標準エラーを logs\services\ へ記録する（ウィジェットの「ログを開く」が参照する）。
+    # exe は Start-Process が 1 つのファイルへ統合できないため、標準エラーは <名前>.err.log に分ける。
+    $logPath = Initialize-ServiceLog $ComponentConfig.Name
+    $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    Add-Content -LiteralPath $logPath -Value "===== $timestamp start: $($ComponentConfig.Name) =====" -Encoding UTF8
     switch ($ComponentConfig.Kind) {
-        'exe' { Start-Process -FilePath $ComponentConfig.File -ArgumentList $ComponentConfig.Args -WorkingDirectory (Split-Path $ComponentConfig.File) -WindowStyle Hidden }
-        'cmd' { Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', 'call', ('"{0}"' -f $ComponentConfig.File)) -WorkingDirectory (Split-Path $ComponentConfig.File) -WindowStyle Hidden }
+        'exe' { Start-Process -FilePath $ComponentConfig.File -ArgumentList $ComponentConfig.Args -WorkingDirectory (Split-Path $ComponentConfig.File) -WindowStyle Hidden -RedirectStandardOutput $logPath -RedirectStandardError ($logPath -replace '\.log$', '.err.log') }
+        'cmd' { Start-Process -FilePath 'cmd.exe' -ArgumentList @('/s', '/c', ('"call "{0}" >> "{1}" 2>&1"' -f $ComponentConfig.File, $logPath)) -WorkingDirectory (Split-Path $ComponentConfig.File) -WindowStyle Hidden }
         'powershell' { Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $ComponentConfig.File)) -WorkingDirectory (Split-Path $ComponentConfig.File) -WindowStyle Hidden }
     }
 }
@@ -352,6 +466,28 @@ function Invoke-ComponentAction([string] $Name, [string] $Operation) {
     $project = $DockerProjects | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
     if (-not ($process -or $container -or $project)) { throw "Unknown component: $Name" }
 
+    if ($Operation -eq 'log') {
+        # 開くべきログファイルのパスを最終行に出力する。Docker は docker logs の末尾を書き出したものを指す。
+        New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+        if ($process) {
+            $path = Get-LogPath $process.Name
+            if (-not (Test-Path -LiteralPath $path)) { throw "$($process.Name): ログがまだありません（ウィジェット / 起動ハブから起動すると記録されます）。" }
+        } else {
+            if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Docker CLI is unavailable. Start Docker Desktop first.' }
+            $path = Get-LogPath $(if ($container) { $container.Name } else { $project.Name })
+            # 名前は許可リスト由来なので cmd.exe 経由のリダイレクトに使ってよい（stderr も統合するため）
+            if ($container) {
+                if (-not (Get-DockerContainerState $container.Container)) { throw "Docker container not found: $($container.Container)" }
+                & cmd.exe /c ('docker logs --tail 2000 {0} > "{1}" 2>&1' -f $container.Container, $path)
+            } else {
+                $composeArgs = (Get-ComposeArguments $project @('logs', '--no-color', '--tail', '500') | ForEach-Object { '"{0}"' -f $_ }) -join ' '
+                & cmd.exe /c ('docker {0} > "{1}" 2>&1' -f $composeArgs, $path)
+            }
+        }
+        Write-Output $path
+        return
+    }
+
     if ($process) {
         if ($Operation -in @('stop', 'restart')) {
             Stop-Component $process
@@ -399,13 +535,9 @@ if ($Status) { Show-Status; exit }
 if ($Stop) { Stop-Components; exit }
 if ($RestartSillyTavern) { Restart-SillyTavern; exit }
 
-switch ($Profile) {
-    'chat' { $selectedNames = @('KoboldCpp (Gemma 4)', 'SillyTavern', 'Rino Life API', 'Rino Agent Service') }
-    'voice' { $selectedNames = @('RVC API', 'EdgeTTS') }
-    'full' { $selectedNames = @('KoboldCpp (Gemma 4)', 'SillyTavern', 'Rino Life API', 'Rino Agent Service', 'RVC API', 'EdgeTTS') }
-    'docker' { $selected = @() }
-}
-if ($Profile -ne 'docker') {
+$selectedNames = @($ProfileComponents[$Profile])
+$selected = @()
+if ($selectedNames.Count) {
     # Hashtable をパイプライン出力で配列化すると値だけに展開される場合があるため、
     # 明示的な List に構成オブジェクトそのものを追加する。
     $selected = [System.Collections.Generic.List[object]]::new()
@@ -422,7 +554,7 @@ if ($Profile -ne 'docker') {
     }
 }
 if ($selected | Where-Object { $_.Name -eq 'Rino Agent Service' }) { Test-RinoAgentEnvironment }
-if ($Profile -in @('chat', 'full', 'docker')) { Start-DockerProjects }
+if ($DockerProfiles -contains $Profile) { Start-DockerProjects }
 if ($selected | Where-Object { $_.Name -eq 'Rino Life API' }) {
     & (Join-Path $Root 'Initialize-RinoLife.ps1')
 }

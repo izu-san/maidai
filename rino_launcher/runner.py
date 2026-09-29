@@ -27,7 +27,10 @@ class ScriptRunner(QObject):
     def is_running(self, tag: str) -> bool:
         return tag in self._running
 
-    def run(self, tag: str, args: list[str]) -> bool:
+    def active_tags(self) -> set[str]:
+        return set(self._running)
+
+    def run(self, tag: str, args: list[str], program: str = "powershell.exe") -> bool:
         if tag in self._running:
             return False
         process = QProcess(self)
@@ -40,7 +43,7 @@ class ScriptRunner(QObject):
         process.finished.connect(lambda code, _status, t=tag: self._guarded(self._on_finished, t, code))
         process.errorOccurred.connect(lambda _err, t=tag: self._guarded(self._on_error, t))
         self._running[tag] = process
-        process.start("powershell.exe", args)
+        process.start(program, args)
         return True
 
     @staticmethod

@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import math
 import sys
+import time
 
-from PySide6.QtCore import QPoint, QPointF, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QIcon, QPainter, QPixmap, QRadialGradient
+from PySide6.QtCore import QPoint, QPointF, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QFontMetrics, QIcon, QPainter, QPixmap, QRadialGradient
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -16,30 +17,42 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
 
+from . import autostart
 from .runner import ScriptRunner
 from .status_model import (
+    GPU_ARGS,
     PROFILES,
     ServiceStatus,
     build_action_args,
     build_profile_args,
     build_status_args,
     build_stop_all_args,
+    detect_problems,
+    format_elapsed,
+    parse_gpu,
+    parse_log_path,
     parse_status,
+    profile_states,
 )
 
 POLL_MS = 5000
+NOTIFY_QUIET_SECONDS = 10  # 操作の完了直後は、意図した停止を異常として通知しない
+# "unhealthy" は状態 running のまま応答確認に失敗している、ウィジェット上の表示専用の状態
 STATE_COLORS = {
     "running": "#3ddc97",
     "loading": "#ffc857",
     "stopped": "#5b6675",
     "missing": "#3a424d",
     "unavailable": "#ff6b6b",
+    "unhealthy": "#ff9f43",
 }
 STATE_LABELS = {
     "running": "起動中",
@@ -47,7 +60,9 @@ STATE_LABELS = {
     "stopped": "停止",
     "missing": "未作成",
     "unavailable": "利用不可",
+    "unhealthy": "応答異常",
 }
+PROFILE_LABELS = {"ready": "全て起動中", "partial": "一部のみ起動中", "off": "未起動"}
 ACTIONS = (("start", "▶", "起動"), ("stop", "■", "停止"), ("restart", "↻", "再起動"))
 SECTIONS = (("process", "サービス"), ("container", "Docker"), ("project", "Docker"))
 
@@ -75,6 +90,17 @@ QPushButton#pill {
 }
 QPushButton#pill:hover { background: rgba(110,168,254,60); color: #fff; }
 QPushButton#pill:pressed { background: rgba(110,168,254,90); }
+QPushButton#pill[fill="ready"] { background: rgba(61,220,151,46); color: #3ddc97; }
+QPushButton#pill[fill="ready"]:hover { background: rgba(61,220,151,90); color: #fff; }
+QPushButton#pill[fill="partial"] { background: rgba(255,200,87,40); color: #ffc857; }
+QPushButton#pill[fill="partial"]:hover { background: rgba(255,200,87,80); color: #fff; }
+QPushButton#tool { background: rgba(255,255,255,10); color: #8b98a9; border-radius: 6px; font-size: 12px; }
+QPushButton#tool:hover { background: rgba(110,168,254,60); color: #fff; }
+QPushButton#tool:disabled { background: transparent; color: #3b4450; }
+QProgressBar { background: rgba(255,255,255,16); border: none; border-radius: 3px; max-height: 6px; min-height: 6px; }
+QProgressBar::chunk { background: #3ddc97; border-radius: 3px; }
+QProgressBar[level="warn"]::chunk { background: #ffc857; }
+QProgressBar[level="high"]::chunk { background: #ff6b6b; }
 QPushButton#danger {
     background: rgba(255,107,107,26); color: #ff9a9a; border-radius: 13px; padding: 0 12px; font-weight: 600;
 }
@@ -139,7 +165,7 @@ class StatusDot(QWidget):
         color = QColor(STATE_COLORS[self._state])
         center = QPointF(self.width() / 2, self.height() / 2)
         pulse = 0.5 + 0.5 * math.sin(self._phase) if self._state == "loading" else 1.0
-        if self._state in ("running", "loading"):
+        if self._state in ("running", "loading", "unhealthy"):
             glow = QRadialGradient(center, 8)
             edge = QColor(color)
             edge.setAlpha(0)
@@ -165,12 +191,29 @@ class ServiceRow(QFrame):
         layout.setSpacing(8)
         self.dot = StatusDot()
         self.title = QLabel(status.name)
-        self.detail = QLabel()
-        self.detail.setObjectName("port")
+        # 状態・経過時間・ポートは固定幅の別ラベルにして、行が違っても縦の列を揃える
+        self.state_label = self._column(52, Qt.AlignmentFlag.AlignRight)
+        self.elapsed_label = self._column(66, Qt.AlignmentFlag.AlignRight)
+        self.port_label = self._column(50, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.dot)
         layout.addWidget(self.title, 1)
-        layout.addWidget(self.detail)
+        layout.addWidget(self.state_label)
+        layout.addWidget(self.elapsed_label)
+        layout.addWidget(self.port_label)
         self.buttons: dict[str, QPushButton] = {}
+        # 補助ボタン（ブラウザで開く / ログを開く）。URL のない行も幅は確保して、ボタン列を揃える
+        for action, glyph, tip in (("open", "↗", "ブラウザで開く"), ("log", "☰", "ログを開く")):
+            button = QPushButton(glyph)
+            button.setObjectName("tool")
+            button.setToolTip(tip)
+            button.setFixedSize(24, 24)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _=False, a=action: on_action(self.name, a))
+            policy = button.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            button.setSizePolicy(policy)
+            layout.addWidget(button)
+            self.buttons[action] = button
         for action, glyph, tip in ACTIONS:
             button = QPushButton(glyph)
             button.setObjectName("act")
@@ -183,13 +226,37 @@ class ServiceRow(QFrame):
             self.buttons[action] = button
         self.update_status(status, busy=False)
 
+    @staticmethod
+    def _column(width: int, align: Qt.AlignmentFlag) -> QLabel:
+        label = QLabel()
+        label.setObjectName("port")
+        label.setFixedWidth(width)
+        label.setAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+        return label
+
     def update_status(self, status: ServiceStatus, busy: bool) -> None:
-        self.dot.set_state("loading" if busy else status.state)
+        unhealthy = status.state == "running" and status.health == "fail"
+        shown = "loading" if busy else ("unhealthy" if unhealthy else status.state)
+        self.dot.set_state(shown)
         port = f":{status.port}" if status.port else ""
-        label = "処理中…" if busy else STATE_LABELS[status.state]
-        self.detail.setText(f"{label}  {port}".strip())
-        self.setToolTip(f"{status.name} — {label}")
+        label = "処理中…" if busy else STATE_LABELS[shown]
+        started = status.started_at
+        # 稼働中は経過時間、停止中の container は「最終起動」の相対時刻を併記する
+        elapsed = format_elapsed(started) if started and status.state in ("running", "loading") else ""
+        self.state_label.setText(label)
+        self.elapsed_label.setText(elapsed)
+        self.port_label.setText(port)
+        tip = f"{status.name} — {label}"
+        if started:
+            local = started.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            tip += f"\n最終起動: {local}（{format_elapsed(started)}前）"
+        if unhealthy:
+            tip += "\nポートは開いていますが、応答確認に失敗しています"
+        self.setToolTip(tip)
         usable = status.state not in ("unavailable", "missing") and not busy
+        self.buttons["open"].setVisible(status.open_url is not None)
+        self.buttons["open"].setEnabled(status.state == "running")
+        self.buttons["log"].setEnabled(status.state not in ("unavailable", "missing"))
         self.buttons["start"].setEnabled(usable and status.state != "running")
         self.buttons["stop"].setEnabled(usable and status.state not in ("stopped",))
         self.buttons["restart"].setEnabled(usable)
@@ -208,6 +275,16 @@ class LauncherWidget(QWidget):
         self._rows: dict[str, ServiceRow] = {}
         self._statuses: dict[str, ServiceStatus] = {}
         self._busy: set[str] = set()
+        self._previous: dict[str, ServiceStatus] | None = None  # 異常通知の比較基準（初回は None）
+        self._quiet_until = 0.0
+        self._gpu_available = True
+        self._pills: dict[str, QPushButton] = {}
+        self._settings = QSettings("MaidAI", "Launcher")
+        self._restoring = True
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self._save_position)
         self.runner = ScriptRunner(self)
         self.runner.finished.connect(self._on_finished)
 
@@ -216,7 +293,7 @@ class LauncherWidget(QWidget):
         outer.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
         self.card = QFrame()
         self.card.setObjectName("card")
-        self.card.setMinimumWidth(380)
+        self.card.setMinimumWidth(470)
         shadow = QGraphicsDropShadowEffect(self.card)
         shadow.setBlurRadius(28)
         shadow.setOffset(0, 6)
@@ -258,6 +335,7 @@ class LauncherWidget(QWidget):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(lambda _=False, p=profile: self.start_profile(p))
             profiles.addWidget(button, 1)
+            self._pills[profile] = button
         stop_all = QPushButton("全停止")
         stop_all.setObjectName("danger")
         stop_all.setFixedHeight(26)
@@ -274,10 +352,35 @@ class LauncherWidget(QWidget):
         sep.setObjectName("sep")
         root.addWidget(sep)
 
+        # GPU（VRAM）使用状況。nvidia-smi が使えない環境では非表示のまま
+        self.gpu_box = QWidget()
+        gpu_layout = QHBoxLayout(self.gpu_box)
+        gpu_layout.setContentsMargins(8, 0, 6, 0)
+        gpu_layout.setSpacing(8)
+        gpu_caption = QLabel("VRAM")
+        gpu_caption.setObjectName("section")
+        self.gpu_bar = QProgressBar()
+        self.gpu_bar.setTextVisible(False)
+        self.gpu_bar.setRange(0, 1000)
+        self.gpu_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.gpu_text = QLabel()
+        self.gpu_text.setObjectName("port")
+        gpu_layout.addWidget(gpu_caption)
+        gpu_layout.addWidget(self.gpu_bar, 1)
+        gpu_layout.addWidget(self.gpu_text)
+        self.gpu_box.setVisible(False)
+        root.addWidget(self.gpu_box)
+
         footer = QHBoxLayout()
         self.msg = QLabel("状態を取得中…")
         self.msg.setObjectName("muted")
         footer.addWidget(self.msg, 1)
+        self.autostart_toggle = QPushButton("自動起動")
+        self.autostart_toggle.setObjectName("link")
+        self.autostart_toggle.setCheckable(True)
+        self.autostart_toggle.setToolTip("Windows へのログイン時にこのウィジェットを自動で起動する")
+        self.autostart_toggle.setChecked(autostart.is_enabled())
+        self.autostart_toggle.toggled.connect(self._toggle_autostart)
         self.log_toggle = QPushButton("ログ")
         self.log_toggle.setObjectName("link")
         self.log_toggle.setCheckable(True)
@@ -285,6 +388,7 @@ class LauncherWidget(QWidget):
         copy = QPushButton("コピー")
         copy.setObjectName("link")
         copy.clicked.connect(self._copy_log)
+        footer.addWidget(self.autostart_toggle)
         footer.addWidget(self.log_toggle)
         footer.addWidget(copy)
         root.addLayout(footer)
@@ -300,6 +404,34 @@ class LauncherWidget(QWidget):
         self.timer.timeout.connect(self.refresh)
         self.timer.start(POLL_MS)
         self.refresh()
+        self._restore_position()
+        self._restoring = False
+        QApplication.instance().aboutToQuit.connect(self._save_position)
+
+    # --- 位置の保存・復元 ---
+    def _restore_position(self) -> None:
+        pos = self._settings.value("position")
+        if not isinstance(pos, QPoint):
+            return
+        self.adjustSize()
+        rect = self.frameGeometry()
+        rect.moveTopLeft(pos)
+        # 保存位置がどのモニターにも十分入らない場合（モニター構成の変更）は既定位置のままにする
+        for screen in QApplication.screens():
+            visible = screen.availableGeometry().intersected(rect)
+            if visible.width() >= 80 and visible.height() >= 40:
+                self.move(pos)
+                return
+
+    def _save_position(self) -> None:
+        self._settings.setValue("position", self.pos())
+        self._settings.sync()
+
+    def moveEvent(self, event) -> None:
+        # startSystemMove ではマウス解放イベントが届かないため、移動後に間引いて保存する
+        super().moveEvent(event)
+        if not self._restoring:
+            self._save_timer.start()
 
     # --- ログ ---
     def _set_log(self, text: str, error: bool = False) -> None:
@@ -319,11 +451,37 @@ class LauncherWidget(QWidget):
     def _copy_log(self) -> None:
         QApplication.clipboard().setText(self.log.toPlainText() or self.msg.toolTip())
 
+    def _toggle_autostart(self, enabled: bool) -> None:
+        try:
+            autostart.set_enabled(enabled)
+        except OSError as exc:
+            self.autostart_toggle.blockSignals(True)
+            self.autostart_toggle.setChecked(not enabled)
+            self.autostart_toggle.blockSignals(False)
+            self._set_log(f"自動起動の設定に失敗: {exc}", error=True)
+            return
+        self._set_log("自動起動を有効にしました" if enabled else "自動起動を無効にしました")
+
     # --- 操作 ---
     def refresh(self) -> None:
         self.runner.run("status", build_status_args())
+        if self._gpu_available:
+            self.runner.run("gpu", GPU_ARGS, program="nvidia-smi")
 
     def do_action(self, name: str, action: str) -> None:
+        if action == "open":
+            status = self._statuses.get(name)
+            if status is not None and status.open_url:
+                QDesktopServices.openUrl(QUrl(status.open_url))
+            return
+        if action == "log":
+            try:
+                args = build_action_args(name, action, set(self._statuses))
+            except ValueError as exc:
+                self._set_log(str(exc), error=True)
+                return
+            self.runner.run(f"log:{name}", args)  # busy 表示は付けない（ログを開くだけ）
+            return
         try:
             args = build_action_args(name, action, set(self._statuses))
         except ValueError as exc:
@@ -352,8 +510,17 @@ class LauncherWidget(QWidget):
                 self._set_log(f"状態取得に失敗: {exc}\n{err.strip()}", error=True)
                 return
             self._statuses = {s.name: s for s in statuses}
+            self._notify_problems()
             self._apply_statuses()
             return
+        if tag == "gpu":
+            self._apply_gpu(code, out)
+            return
+        if tag.startswith("log:"):
+            self._open_log(tag.split(":", 1)[1], code, out, err)
+            return
+        # 起動・停止の完了直後は、意図した停止を異常として通知しない
+        self._quiet_until = time.monotonic() + NOTIFY_QUIET_SECONDS
         if tag.startswith("action:"):
             self._busy.discard(tag.split(":", 1)[1])
         if code == 0:
@@ -361,6 +528,52 @@ class LauncherWidget(QWidget):
         else:
             self._set_log(f"{tag}: 失敗 (exit {code})\n{(err or out).strip()}", error=True)
         self.refresh()
+
+    def _notify_problems(self) -> None:
+        """前回から新たに停止・応答異常になったサービスをトレイ通知する（操作中・直後は除く）。"""
+        current = self._statuses
+        operating = any(
+            tag not in ("status", "gpu") and not tag.startswith("log:") for tag in self.runner.active_tags()
+        )
+        if operating or time.monotonic() < self._quiet_until:
+            self._previous = current  # 意図した変化は基準だけ更新して通知しない
+            return
+        messages = detect_problems(self._previous, current)
+        self._previous = current
+        if messages:
+            text = "\n".join(messages)
+            self.tray.showMessage("MaidAI", text, QSystemTrayIcon.MessageIcon.Warning, 8000)
+            self._set_log(text, error=True)
+
+    def _apply_gpu(self, code: int, out: str) -> None:
+        if code == -1:  # nvidia-smi が見つからない・起動できない環境では以後取得しない
+            self._gpu_available = False
+            self.gpu_box.setVisible(False)
+            return
+        info = parse_gpu(out) if code == 0 else None
+        self.gpu_box.setVisible(info is not None)
+        if info is None or info.total_mb <= 0:
+            return
+        ratio = info.used_mb / info.total_mb
+        self.gpu_bar.setValue(int(ratio * 1000))
+        self.gpu_bar.setProperty("level", "high" if ratio >= 0.9 else "warn" if ratio >= 0.75 else "ok")
+        self.gpu_bar.style().unpolish(self.gpu_bar)
+        self.gpu_bar.style().polish(self.gpu_bar)
+        self.gpu_text.setText(f"{info.used_mb / 1024:.1f} / {info.total_mb / 1024:.1f} GB · {info.util_percent}%")
+        self.gpu_box.setToolTip(f"{info.name}\nVRAM 使用 {info.used_mb} / {info.total_mb} MiB、GPU 使用率 {info.util_percent}%")
+
+    def _open_log(self, name: str, code: int, out: str, err: str) -> None:
+        if code != 0:
+            self._set_log(f"{name}: ログを取得できません\n{(err or out).strip()}", error=True)
+            return
+        path = parse_log_path(out)
+        if path is None:
+            self._set_log(f"{name}: ログの場所を確認できませんでした", error=True)
+            return
+        # 関連付けがなく開けない場合は、ログの置き場所のフォルダを開く
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+        self._set_log(f"{name}: ログを開きました\n{path}")
 
     def _clear_rows(self) -> None:
         while self.rows_layout.count():
@@ -398,6 +611,13 @@ class LauncherWidget(QWidget):
         self.chip.setText(f"{running} / {total} 起動中")
         self.tray.setIcon(_dot_icon(STATE_COLORS["running" if running else "stopped"]))
         self.tray.setToolTip(f"MaidAI: {running}/{total} 起動中")
+        for profile, fill in profile_states(list(self._statuses.values())).items():
+            pill = self._pills[profile]
+            if pill.property("fill") != fill:
+                pill.setProperty("fill", fill)
+                pill.style().unpolish(pill)
+                pill.style().polish(pill)
+            pill.setToolTip(f"プロファイル {profile} を起動（現在: {PROFILE_LABELS[fill]}）")
         if self.msg.toolTip() == "" or self.msg.text() == "状態を取得中…":
             self.msg.setText("")
 
