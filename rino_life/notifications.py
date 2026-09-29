@@ -88,7 +88,8 @@ class NotificationRouter:
 
 async def run_notification_router(router: NotificationRouter | None = None, url: str | None = None) -> None:
     import nats
-    router = router or NotificationRouter()
+    from .agent_notifier import agent_chat_notifier
+    router = router or NotificationRouter(notifier=agent_chat_notifier)
     nc = await nats.connect(url or os.environ.get("RINO_LIFE_NATS_URL", "nats://127.0.0.1:54222"))
     try:
         sub = await nc.jetstream().pull_subscribe("life.consumable.low.v1", durable=CONSUMER_NAME, stream="RINO_LIFE")

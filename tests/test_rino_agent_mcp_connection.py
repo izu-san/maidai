@@ -46,3 +46,4 @@ def test_mcp_children_do_not_receive_agent_secret(monkeypatch):
 def test_life_mcp_exposes_only_named_domain_tools():
     assert "life.emit_life_event" not in _LIFE_TOOLS
     assert "life.register_consumable" in _LIFE_TOOLS
+    assert "life.record_finance_transaction" in _LIFE_TOOLS

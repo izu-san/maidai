@@ -4,7 +4,8 @@ Only this module writes consumable state; callers supply validated event envelop
 """
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import json, os
 from pathlib import Path
 from typing import Any, Callable
@@ -14,7 +15,7 @@ import yaml
 
 from .contracts import LifeEventEnvelope, validate_event
 
-LIFE_EVENTS = {"life.laundry.completed.v1", "life.consumable.purchased.v1", "life.consumable.opened.v1", "life.consumable.adjusted.v1", "life.consumable.registered.v1", "life.consumable.deactivated.v1"}
+LIFE_EVENTS = {"life.laundry.completed.v1", "life.consumable.purchased.v1", "life.consumable.opened.v1", "life.consumable.adjusted.v1", "life.consumable.registered.v1", "life.consumable.deactivated.v1", "life.consumable.daily_consumed.v1"}
 
 @dataclass(frozen=True)
 class Consumable:
@@ -25,6 +26,10 @@ class Consumable:
 def load_seed(path: str | Path | None = None) -> list[dict[str, Any]]:
     source = Path(path) if path else Path(__file__).with_name("config") / "consumables.yaml"
     return [{"id": item_id, **value} for item_id, value in yaml.safe_load(source.read_text(encoding="utf-8"))["consumables"].items()]
+
+JST = ZoneInfo("Asia/Tokyo")
+
+def today_jst() -> date: return datetime.now(JST).date()
 
 class ConsumableService:
     def __init__(self, dsn: str | None = None, connect: Callable[..., Any] | None = None):
@@ -94,6 +99,7 @@ class ConsumableService:
             return updated
 
     def _targets(self, cursor: Any, event: LifeEventEnvelope) -> list[tuple[Consumable, Consumable]]:
+        if event.type == "life.consumable.daily_consumed.v1": return self._daily_targets(cursor, date.fromisoformat(event.payload["date"]))
         if event.type == "life.laundry.completed.v1":
             cursor.execute("SELECT id,name,category,unit,capacity,remaining,stock_unopened,estimated,usage_model,reminder,version FROM consumables WHERE active=true FOR UPDATE")
             items = [self._row(row) for row in cursor.fetchall()]
@@ -108,6 +114,21 @@ class ConsumableService:
         if remaining > item.capacity: raise ValueError("remaining cannot exceed capacity")
         return [(item, self._changed(item, remaining=remaining, estimated=event.payload["estimated"]))]
 
+    def _daily_targets(self, cursor: Any, through: date) -> list[tuple[Consumable, Consumable]]:
+        """Deduct PER_DAY usage for every day after the last applied day, up to and including `through`.
+
+        The per-item applied date makes the event idempotent and lets a stopped host catch up.
+        """
+        if through > today_jst() + timedelta(days=1): raise ValueError("date cannot be in the future")
+        cursor.execute("SELECT id,name,category,unit,capacity,remaining,stock_unopened,estimated,usage_model,reminder,version,usage_applied_on FROM consumables WHERE active=true AND usage_model->>'type'='PER_DAY' FOR UPDATE")
+        changed = []
+        for row in cursor.fetchall():
+            item, applied_on = self._row(row[:11]), row[11]
+            days = (through - applied_on).days if applied_on else 0
+            if applied_on is None or days > 0: cursor.execute("UPDATE consumables SET usage_applied_on=%s WHERE id=%s", (through, item.id))
+            if days > 0: changed.append((item, self._changed(item, remaining=max(0.0, item.remaining - float(item.usage_model["amount"]) * days), estimated=True)))
+        return changed
+
     def _locked(self, cursor: Any, item_id: str) -> Consumable:
         cursor.execute("SELECT id,name,category,unit,capacity,remaining,stock_unopened,estimated,usage_model,reminder,version FROM consumables WHERE id=%s AND active=true FOR UPDATE", (item_id,))
         row = cursor.fetchone()
@@ -116,8 +137,14 @@ class ConsumableService:
     @staticmethod
     def _register(cursor: Any, event: LifeEventEnvelope) -> None:
         p = event.payload; remaining = float(p.get("remaining", p["capacity"]))
+        usage, capacity = p.get("usage_model", {}), float(p["capacity"])
+        if p["unit"].lower() in ("g", "ml") and capacity < 10: raise ValueError(f"capacity {capacity:g} {p['unit']} looks like a kg/L value; register g/ml in grams/milliliters (2 kg = 2000 g)")
         if remaining > float(p["capacity"]): raise ValueError("remaining cannot exceed capacity")
-        cursor.execute("INSERT INTO consumables (id,name,category,unit,capacity,remaining,stock_unopened,estimated,usage_model,reminder,active) VALUES (%s,%s,%s,%s,%s,%s,%s,false,%s::jsonb,%s::jsonb,true)", (p["item_id"],p["name"],p["category"],p["unit"],p["capacity"],remaining,p.get("stock_unopened", 0),json.dumps(p.get("usage_model", {})),json.dumps(p.get("reminder", {}))))
+        below = (p.get("reminder") or {}).get("remaining_below")
+        if below is not None and not 0 <= float(below) <= capacity: raise ValueError("reminder.remaining_below must be between 0 and capacity")
+        if usage.get("type") == "PER_DAY" and not (isinstance(usage.get("amount"), (int, float)) and not isinstance(usage["amount"], bool) and usage["amount"] > 0): raise ValueError("PER_DAY usage_model requires a positive numeric amount")
+        if usage.get("type") == "PER_DAY" and usage["amount"] > capacity: raise ValueError("PER_DAY amount cannot exceed capacity")
+        cursor.execute("INSERT INTO consumables (id,name,category,unit,capacity,remaining,stock_unopened,estimated,usage_model,reminder,active,usage_applied_on) VALUES (%s,%s,%s,%s,%s,%s,%s,false,%s::jsonb,%s::jsonb,true,%s)", (p["item_id"],p["name"],p["category"],p["unit"],p["capacity"],remaining,p.get("stock_unopened", 0),json.dumps(usage),json.dumps(p.get("reminder", {})),today_jst() if usage.get("type") == "PER_DAY" else None))
     @staticmethod
     def _changed(item: Consumable, **changes: Any) -> Consumable: return Consumable(**{**item.__dict__, **changes, "version": item.version + 1})
     @staticmethod

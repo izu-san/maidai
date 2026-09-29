@@ -20,7 +20,7 @@ requires `Authorization: Bearer <RINO_AGENT_API_TOKEN>`.
 
 `/agent/run` accepts `{ "goal": "...", "session_id": "optional" }`. It returns
 either `succeeded` or `approval_required`. Approval requests are scoped to the
-session and tool arguments, expire after 60 seconds, and are single use.
+session and tool arguments, expire after 60 seconds, and are single use. The `approval` object carries `description`, a Japanese confirmation sentence for supported tools (life register/deactivate/finance, `home.set_temperature`, `home.tv_on`, `home.lock_door`), or `null` for others; the chat UI shows it instead of the raw `arguments`.
 
 Sessions and approvals are intentionally in-memory. On a Service restart they
 are discarded, so an action can never resume automatically. MAF workflow
@@ -48,3 +48,12 @@ object matching `{ type, source, timestamp, data }`; the extension forwards it
 to the authenticated Event Gateway. It never forwards a vision event directly
 to the LLM. Event timestamps must contain a timezone and event/task data is
 limited to 16 KiB.
+
+## Life 通知の受信箱
+
+| メソッド | パス | 説明 |
+|---|---|---|
+| POST | `/internal/notifications` | Rino Life 通知 router が表示用メッセージを積む。本文 `{dedupe_key, message(≤500字)}`。同じ `dedupe_key` の未表示分は置き換え、最大 50 件・24 時間保持（メモリのみ）。 |
+| POST | `/agent/notifications/drain` | 保留中メッセージを取り出して空にする。`{messages: [...]}`。SillyTavern サーバー経由（`/api/rino-agent/notifications/drain`）で拡張が 15 秒間隔で呼ぶ。 |
+
+両方とも Bearer トークンが必要で、Agent の実行は起動しない。

@@ -22,9 +22,24 @@ py -3.13 -c "from rino_life.consumables import ConsumableService; ConsumableServ
 
 Start the API with `py -3.13 -m uvicorn rino_life.api:app --host 127.0.0.1 --port 54330`. Its lifespan owns the outbox publisher and the notification, environment, PC-state, and Vision consumers. `POST /events` is the only state-write boundary: it validates the event and writes history, snapshot, and Outbox row in one transaction. The LLM-facing `LifeTools` facade has no database or NATS handle.
 
+### Daily (`PER_DAY`) consumption
+
+A consumable whose `usage_model` is `{"type": "PER_DAY", "amount": N}` is deducted N per day. The Life API lifespan runs `rino_life.daily_usage.run_daily_usage`, which every 15 minutes applies `life.consumable.daily_consumed.v1` (payload `{"date": "YYYY-MM-DD"}`, Japan date) through `ConsumableService.apply`. Each item stores `usage_applied_on` (migration `20260929_09`); the event deducts `N × days since that date`, so missed days are caught up and repeated ticks are idempotent (the event id is derived from the date). Registration starts counting from the registration day, and deducted values are marked `estimated`. `PER_EVENT` (laundry) remains user-reported; items without a usage model change only by adjustment, opening, or purchase.
+
 ## Agent integration
 
-`rino_agent/config/mcp.yaml` enables the private `rino-life` stdio MCP by default. Its fixed consumable and laundry tools call the loopback Life API (`RINO_LIFE_API_URL`, default `http://127.0.0.1:54330`) and cannot access PostgreSQL or NATS directly. `Start-MaidAI.ps1` starts the Life API before the Agent in `chat` and `full` profiles. This connection enables user-requested life records and queries only. PC monitor and notification-router outputs are still recorded/routed inside Rino Life and are not automatically delivered to the chat UI.
+`rino_agent/config/mcp.yaml` enables the private `rino-life` stdio MCP by default. Its fixed consumable, laundry, and household-finance tools call the loopback Life API (`RINO_LIFE_API_URL`, default `http://127.0.0.1:54330`) and cannot access PostgreSQL or NATS directly. `Start-MaidAI.ps1` starts the Life API before the Agent in `chat` and `full` profiles. This connection enables user-requested life records and queries only. PC monitor and notification-router outputs are still recorded/routed inside Rino Life and are not automatically delivered to the chat UI.
+
+## Household finance ledger
+
+Rino Life can record approved, manually stated Japanese-yen expenses and income.
+It stores a transaction date, standard category, amount, and optional short memo;
+it does not connect to banks, cards, or payment accounts, manage balances, import
+CSV files, or perform currency conversion. `life.record_finance_transaction`,
+`life.correct_finance_transaction`, and `life.cancel_finance_transaction` always
+require Agent approval. `life.get_monthly_finance_summary` and
+`life.list_finance_transactions` are read-only tools for a `YYYY-MM` month.
+Corrections and cancellations retain the original event and transaction history.
 
 ## Phase 4 PC / Vision / routine
 
@@ -32,4 +47,4 @@ Start the API with `py -3.13 -m uvicorn rino_life.api:app --host 127.0.0.1 --por
 
 ## Phase 3 notifications
 
-The normal hub starts the notification router with the Life API. Low-stock candidates are written in the same transaction as the consumable snapshot and are routed by the durable `life-notification-router-v1` consumer. Each decision (sent, aggregated, cooldown/quiet-hours suppression, acknowledgement, and resolution) is retained in `notification_history.reason`; notification delivery itself remains an injected adapter, rather than direct Agent execution.
+The normal hub starts the notification router with the Life API. Low-stock candidates are written in the same transaction as the consumable snapshot and are routed by the durable `life-notification-router-v1` consumer. Each decision (sent, aggregated, cooldown/quiet-hours suppression, acknowledgement, and resolution) is retained in `notification_history.reason`; the router's notifier (`rino_life/agent_notifier.py`) queues consumable-low messages in the Agent Service inbox (`POST /internal/notifications`, loopback + Bearer `RINO_AGENT_API_TOKEN`, optional loopback-only `RINO_AGENT_URL`); the SillyTavern RinoAgent extension drains the inbox and shows them in the Rino chat. Delivery failures are logged and not retried (the cooldown still applies). It never triggers Agent execution. PC and other subjects are not delivered, and voice output is not connected.

@@ -27,6 +27,8 @@ from .config import load_settings
 from .context import build_context
 from .workflows import create_event_notification_workflow, create_sleep_workflow
 from .websocket import AgentEventHub
+from .notifications import NotificationInbox
+from .approval_text import describe_approval
 from .mcp import connect_servers
 from .storage import ensure_private_directory
 from .middleware import RinoPolicyMiddleware
@@ -54,7 +56,8 @@ async def lifespan(app: FastAPI):
             ),
             name="Rino",
             instructions=("You are Rino. Use home and life tools only when the user explicitly requests the related action or information. "
-                          "Life tools record or retrieve consumable and laundry information; they never control devices. "
+                          "Life tools record or retrieve consumable, laundry, and household-finance information; they never control devices. "
+                          "Before calling life.register_consumable, convert units yourself so capacity, remaining and thresholds share one unit (2 kg of food is capacity 2000 with unit g; 1 L is 1000 ml), then collect and confirm: the name, capacity and unit, current remaining amount, the remaining amount at which to notify (reminder.remaining_below), and how it decreases (a fixed daily amount, per laundry, or manual only). Ask for any that are missing, one short question list at a time. Deduction models: for an item consumed a fixed amount every day (e.g. pet food), register usage_model {type: PER_DAY, amount: <per-day amount in the item's unit>} so it is deducted daily starting today; ask the daily amount. Laundry items use {type: PER_EVENT, event: laundry.completed, amount} and are deducted only when the user reports finishing laundry. Otherwise omit usage_model and tell the user the remaining amount is updated only when they report it (life.adjust_consumable, opening, or purchase). Never claim a registration succeeded unless the tool result confirms it.For a finance request, identify the amount, income or expense, category, and transaction date; ask when any are ambiguous, then use the approved finance tool. "
                           "Explain results concisely in Japanese. Never claim a real-world action succeeded when a tool result says verification is UNAVAILABLE; say the command was sent but could not be verified."),
             tools=list(mcp_servers.values()),
             middleware=[RinoPolicyMiddleware(settings.tools, app.state.audit, app.state.sessions)],
@@ -70,6 +73,7 @@ async def lifespan(app: FastAPI):
         app.state.sleep_workflow = create_sleep_workflow(switchbot_mcp, str(checkpoints))
         app.state.event_notification_workflow = create_event_notification_workflow(str(checkpoints))
         app.state.event_hub = AgentEventHub()
+        app.state.notifications = NotificationInbox()
         image_enabled = os.environ.get("RINO_IMAGE_GENERATION_ENABLED", "false").lower() == "true"
         app.state.image_generation = ImageGenerationService(ImageGenerationConfig.from_environment(), app.state.event_hub, app.state.audit) if image_enabled else None
         yield
@@ -105,6 +109,11 @@ class AgentRunRequest(BaseModel):
 class ApprovalResponse(BaseModel):
     session_id: str
     approval_id: str
+
+
+class LifeNotificationRequest(BaseModel):
+    dedupe_key: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=500)
 
 
 class CancelRequest(BaseModel):
@@ -189,6 +198,7 @@ def response_payload(response, session_id: str) -> dict:
             "approval_id": approval.approval_id,
             "tool": approval.tool_name,
             "arguments": redact(normalize_arguments(approval.request.function_call.arguments)),
+            "description": describe_approval(approval.tool_name, redact(normalize_arguments(approval.request.function_call.arguments))),
             "risk": policy.risk.value if policy else "BLOCKED",
             "expires_in_seconds": app.state.sessions.approval_ttl_seconds,
         },
@@ -291,8 +301,8 @@ async def agent_reject(request: ApprovalResponse) -> dict:
 @app.post("/agent/respond", dependencies=[Depends(require_local_api_token)])
 async def agent_respond(request: NaturalApprovalRequest) -> dict:
     normalized = request.text.strip().lower().replace("。", "").replace("！", "")
-    approvals = {"はい", "うん", "お願い", "お願いします", "おねがい", "yes", "ok"}
-    rejections = {"いいえ", "いや", "だめ", "不要", "no", "cancel"}
+    approvals = {"はい", "うん", "お願い", "お願いします", "おねがい", "いいよ", "いいです", "いいですよ", "大丈夫", "おっけー", "オッケー", "どうぞ", "承認", "実行して", "登録して", "yes", "ok", "okay"}
+    rejections = {"いいえ", "いや", "だめ", "ダメ", "不要", "やめて", "やめる", "キャンセル", "no", "cancel"}
     try:
         approval = app.state.sessions.pending_for_session(request.session_id)
     except ApprovalError as error:
@@ -370,6 +380,18 @@ async def create_task(request: WaitingTaskRequest) -> dict:
     task = app.state.events.add_task(request.event_type, request.payload, request.ttl_seconds)
     app.state.audit.write("task.registered", task_id=task.task_id, event_type=task.event_type)
     return {"task_id": task.task_id, "status": task.status}
+
+
+@app.post("/internal/notifications", dependencies=[Depends(require_local_api_token)])
+async def post_life_notification(request: LifeNotificationRequest) -> dict:
+    app.state.notifications.add(request.dedupe_key, request.message)
+    app.state.audit.write("notification.queued", dedupe_key=request.dedupe_key)
+    return {"queued": True}
+
+
+@app.post("/agent/notifications/drain", dependencies=[Depends(require_local_api_token)])
+async def drain_life_notifications() -> dict:
+    return {"messages": app.state.notifications.drain()}
 
 
 @app.websocket("/ws/agent")

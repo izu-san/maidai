@@ -18,6 +18,8 @@ _LIFE_TOOLS = {
     "life.get_consumable_state", "life.list_low_stock_items", "life.list_consumables",
     "life.record_laundry_completed", "life.record_purchase", "life.record_opened_item",
     "life.adjust_consumable", "life.register_consumable", "life.deactivate_consumable",
+    "life.record_finance_transaction", "life.correct_finance_transaction", "life.cancel_finance_transaction",
+    "life.get_monthly_finance_summary", "life.list_finance_transactions",
 }
 _SWITCHBOT_TOOLS = {
     "home.get_environment", "home.light_on", "home.light_off", "home.aircon_on", "home.aircon_off",
@@ -75,8 +77,8 @@ async def connect_servers(servers: dict[str, dict]) -> tuple[AsyncExitStack, dic
                     name, command=sys.executable, args=["-m", module], allowed_tools=_LIFE_TOOLS,
                     env=child_environment(name),
                     approval_mode={
-                        "always_require_approval": ["life.register_consumable", "life.deactivate_consumable"],
-                        "never_require_approval": sorted(_LIFE_TOOLS - {"life.register_consumable", "life.deactivate_consumable"}),
+                        "always_require_approval": ["life.register_consumable", "life.deactivate_consumable", "life.record_finance_transaction", "life.correct_finance_transaction", "life.cancel_finance_transaction"],
+                        "never_require_approval": sorted(_LIFE_TOOLS - {"life.register_consumable", "life.deactivate_consumable", "life.record_finance_transaction", "life.correct_finance_transaction", "life.cancel_finance_transaction"}),
                     },
                 )
             else:

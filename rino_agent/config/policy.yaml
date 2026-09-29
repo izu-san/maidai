@@ -18,6 +18,11 @@ tools:
   life.adjust_consumable: { risk: LOW, autonomous: true }
   life.register_consumable: { risk: MEDIUM, autonomous: false }
   life.deactivate_consumable: { risk: MEDIUM, autonomous: false }
+  life.record_finance_transaction: { risk: MEDIUM, autonomous: false }
+  life.correct_finance_transaction: { risk: MEDIUM, autonomous: false }
+  life.cancel_finance_transaction: { risk: MEDIUM, autonomous: false }
+  life.get_monthly_finance_summary: { risk: READ_ONLY, autonomous: true }
+  life.list_finance_transactions: { risk: READ_ONLY, autonomous: true }
   obs.get_status: { risk: READ_ONLY, autonomous: true }
   obs.start_stream: { risk: HIGH, approval: always }
   obs.stop_stream: { risk: HIGH, approval: always }

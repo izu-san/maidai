@@ -16,8 +16,13 @@ not `trust: internal` and `transport: stdio`.
   PowerShell, cmd, registry, mouse, or keyboard tool is available.
 - Rino Life: it is enabled by default and calls only `RINO_LIFE_API_URL`
   (default `http://127.0.0.1:54330`). Its stdio child receives no database,
-  NATS, or Agent API credentials. Named consumable/laundry tools are exposed;
+  NATS, or Agent API credentials. Named consumable/laundry/household-finance tools are exposed;
   it does not accept arbitrary event subjects or payloads.
+
+Household-finance writes (record, correction, cancellation) are `MEDIUM` risk
+and always need session approval. Finance reads are read-only. The tools record
+manual Japanese-yen ledger facts only; they cannot access bank, card, account,
+or payment credentials.
 
 New tool names require a matching entry in `policy.yaml`; otherwise the MAF
 Policy Middleware blocks them before invocation.
